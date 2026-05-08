@@ -40,6 +40,9 @@ output/
 results/
 models/
 checkpoints/
+Dataset/Linking/
+Dataset/Processed/
+Dataset/Parquet/
 
 # Data
 dataset/
