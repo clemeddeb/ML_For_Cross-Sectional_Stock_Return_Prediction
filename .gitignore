@@ -46,6 +46,7 @@ Dataset/Parquet/
 
 # Data
 dataset/
+Dataset/
 
 # IDEs
 .idea/

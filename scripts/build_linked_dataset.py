@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 DEFAULT_CCM = Path("Dataset/Linking/ccm_links.parquet")
-DEFAULT_CRSP = Path("Dataset/Targets/monthly_crsp.csv")
+DEFAULT_CRSP = Path("Dataset/Processed/crsp_monthly_deduped.parquet")
 DEFAULT_COMPUSTAT = Path("Dataset/Predictors/CompFirmCharac.csv")
 DEFAULT_10K = Path("Dataset/Predictors/10K_fillings.parquet")
 DEFAULT_CALLS = Path("Dataset/Predictors/sm-calls_with_connectors.parquet")
@@ -232,8 +234,9 @@ def link_by_permno_date(
     obs["_row_id"] = range(len(obs))
     obs[permno_col] = pd.to_numeric(obs[permno_col], errors="coerce").astype("Int64")
     obs[date_col] = pd.to_datetime(obs[date_col], errors="coerce")
+    link_base = obs[["_row_id", permno_col, date_col]].copy()
 
-    candidates = obs.merge(
+    candidates = link_base.merge(
         ccm,
         left_on=permno_col,
         right_on="ccm_permno",
@@ -260,8 +263,9 @@ def link_by_gvkey_date(
     obs["_row_id"] = range(len(obs))
     obs[gvkey_col] = normalize_gvkey(obs[gvkey_col])
     obs[date_col] = pd.to_datetime(obs[date_col], errors="coerce")
+    link_base = obs[["_row_id", gvkey_col, date_col]].copy()
 
-    candidates = obs.merge(
+    candidates = link_base.merge(
         ccm,
         left_on=gvkey_col,
         right_on="gvkey",
@@ -279,17 +283,27 @@ def link_by_gvkey_date(
 
 
 def load_crsp(path: Path) -> pd.DataFrame:
-    crsp = pd.read_csv(
-        path,
-        dtype={
-            "PERMNO": "Int64",
-            "PERMCO": "Int64",
-            "HdrCUSIP": "string",
-            "CUSIP": "string",
-            "Ticker": "string",
-            "TradingSymbol": "string",
-        },
-    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing monthly CRSP input: {path}. "
+            "Run scripts/01_deduplicate_crsp.py before building linked datasets."
+        )
+
+    dtype = {
+        "PERMNO": "Int64",
+        "PERMCO": "Int64",
+        "HdrCUSIP": "string",
+        "CUSIP": "string",
+        "Ticker": "string",
+        "TradingSymbol": "string",
+    }
+    if path.suffix.lower() == ".parquet":
+        crsp = pd.read_parquet(path)
+        for col, dtype_name in dtype.items():
+            if col in crsp.columns:
+                crsp[col] = crsp[col].astype(dtype_name)
+    else:
+        crsp = pd.read_csv(path, dtype=dtype)
     crsp = lower_columns(crsp)
     crsp["mthcaldt"] = pd.to_datetime(crsp["mthcaldt"], errors="coerce")
     return crsp
@@ -335,12 +349,12 @@ def prefix_compustat_columns(comp: pd.DataFrame) -> pd.DataFrame:
     return comp.rename(columns=rename)
 
 
-def build_compustat_panel(
+def iter_compustat_panel_chunks(
     crsp_with_gvkey: pd.DataFrame,
     comp: pd.DataFrame,
     lag_months: int,
     max_age_days: int,
-) -> pd.DataFrame:
+):
     comp_panel = comp.copy()
     comp_panel["comp_available_date"] = comp_panel["datadate"] + pd.DateOffset(months=lag_months)
     comp_panel = prefix_compustat_columns(comp_panel)
@@ -349,30 +363,130 @@ def build_compustat_panel(
     # pandas merge_asof requires the as-of key to be globally sorted even when
     # matching within by-groups.
     left = left.sort_values(["mthcaldt", "gvkey"])
+    left["_panel_year"] = left["mthcaldt"].dt.year
     right = comp_panel.dropna(subset=["gvkey", "comp_available_date"]).sort_values(
         ["comp_available_date", "gvkey"]
     )
 
-    panel = pd.merge_asof(
-        left,
-        right,
-        by="gvkey",
-        left_on="mthcaldt",
-        right_on="comp_available_date",
-        direction="backward",
-    )
-    panel["compustat_age_days"] = (
-        panel["mthcaldt"] - panel["comp_available_date"]
-    ).dt.days
-    panel["compustat_match"] = panel["compustat_age_days"].between(
-        0, max_age_days, inclusive="both"
-    )
+    pieces = []
+    years = sorted(left["_panel_year"].dropna().unique())
+    print(f"Building Compustat panel in {len(years):,} yearly chunks...", flush=True)
+    for index, year in enumerate(years, start=1):
+        print(f"  Compustat panel chunk {index:,}/{len(years):,}: {int(year)}", flush=True)
+        left_chunk = left[left["_panel_year"].eq(year)].drop(columns="_panel_year")
+        panel_chunk = pd.merge_asof(
+            left_chunk,
+            right,
+            by="gvkey",
+            left_on="mthcaldt",
+            right_on="comp_available_date",
+            direction="backward",
+        )
+        panel_chunk["compustat_age_days"] = (
+            panel_chunk["mthcaldt"] - panel_chunk["comp_available_date"]
+        ).dt.days
+        panel_chunk["compustat_match"] = panel_chunk["compustat_age_days"].between(
+            0, max_age_days, inclusive="both"
+        )
 
-    stale = ~panel["compustat_match"].fillna(False)
-    comp_cols = [c for c in panel.columns if c.startswith("comp_")]
-    panel.loc[stale, comp_cols] = pd.NA
-    panel.loc[stale, "compustat_age_days"] = pd.NA
-    return panel
+        stale = ~panel_chunk["compustat_match"].fillna(False)
+        comp_cols = [c for c in panel_chunk.columns if c.startswith("comp_")]
+        panel_chunk.loc[stale, comp_cols] = pd.NA
+        panel_chunk.loc[stale, "compustat_age_days"] = pd.NA
+        yield panel_chunk
+
+
+def write_compustat_panel(
+    output_path: Path,
+    crsp_with_gvkey: pd.DataFrame,
+    comp: pd.DataFrame,
+    lag_months: int,
+    max_age_days: int,
+) -> dict[str, int | float]:
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    writer = None
+    summary = {
+        "rows": 0,
+        "gvkey_matched_rows": 0,
+        "permno_nonmissing_rows": 0,
+        "compustat_matched_rows": 0,
+    }
+
+    try:
+        for panel_chunk in iter_compustat_panel_chunks(
+            crsp_with_gvkey,
+            comp,
+            lag_months=lag_months,
+            max_age_days=max_age_days,
+        ):
+            row_count = len(panel_chunk)
+            summary["rows"] += row_count
+            summary["gvkey_matched_rows"] += int(panel_chunk["gvkey"].notna().sum())
+            summary["permno_nonmissing_rows"] += int(panel_chunk["permno"].notna().sum())
+            summary["compustat_matched_rows"] += int(
+                panel_chunk["compustat_match"].fillna(False).sum()
+            )
+
+            table = pa.Table.from_pandas(panel_chunk, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temp_path, schema_with_promoted_nulls(table.schema, panel_chunk)
+                )
+            table = table.cast(writer.schema, safe=False)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    temp_path.replace(output_path)
+    summary["gvkey_match_pct"] = pct(summary["gvkey_matched_rows"], summary["rows"])
+    summary["permno_nonmissing_pct"] = pct(
+        summary["permno_nonmissing_rows"], summary["rows"]
+    )
+    summary["compustat_match_pct"] = pct(
+        summary["compustat_matched_rows"], summary["rows"]
+    )
+    return summary
+
+
+def schema_with_promoted_nulls(schema: pa.Schema, df: pd.DataFrame) -> pa.Schema:
+    fields = []
+    for field in schema:
+        if not pa.types.is_null(field.type):
+            fields.append(field)
+            continue
+
+        dtype = df[field.name].dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            arrow_type = pa.int64()
+        elif pd.api.types.is_float_dtype(dtype):
+            arrow_type = pa.float64()
+        elif pd.api.types.is_bool_dtype(dtype):
+            arrow_type = pa.bool_()
+        else:
+            arrow_type = pa.string()
+        fields.append(pa.field(field.name, arrow_type, nullable=True))
+    return pa.schema(fields, metadata=schema.metadata)
+
+
+def build_compustat_panel(
+    crsp_with_gvkey: pd.DataFrame,
+    comp: pd.DataFrame,
+    lag_months: int,
+    max_age_days: int,
+) -> pd.DataFrame:
+    return pd.concat(
+        iter_compustat_panel_chunks(
+            crsp_with_gvkey,
+            comp,
+            lag_months=lag_months,
+            max_age_days=max_age_days,
+        ),
+        ignore_index=True,
+    )
 
 
 def link_sec_10k(sec_path: Path, comp: pd.DataFrame, ccm: pd.DataFrame, drop_text: bool, tolerance_days: int) -> pd.DataFrame:
@@ -442,29 +556,111 @@ def link_calls(calls_path: Path, ccm: pd.DataFrame, drop_text: bool) -> pd.DataF
     return link_by_permno_date(calls, ccm, "permno", "mostimportantdateutc")
 
 
+def write_calls_with_gvkey(
+    calls_path: Path,
+    output_path: Path,
+    ccm: pd.DataFrame,
+    drop_text: bool,
+    batch_size: int = 1_000,
+) -> dict[str, int | float]:
+    parquet_file = pq.ParquetFile(calls_path)
+    source_columns = parquet_file.schema_arrow.names
+    metadata_columns = [c for c in source_columns if c.lower() != "text"]
+
+    calls_meta = pd.read_parquet(calls_path, columns=metadata_columns)
+    calls_meta = lower_columns(calls_meta)
+    calls_meta["mostimportantdateutc"] = pd.to_datetime(
+        calls_meta["mostimportantdateutc"], errors="coerce"
+    )
+    calls_meta["call_month"] = calls_meta["mostimportantdateutc"] + pd.offsets.MonthEnd(0)
+    linked_meta = link_by_permno_date(calls_meta, ccm, "permno", "mostimportantdateutc")
+    link_cols = ["call_month", "gvkey", "ccm_permco", "liid", "linktype", "linkprim", "linkdt", "linkenddt"]
+
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    writer = None
+    row_offset = 0
+    try:
+        read_columns = [c for c in source_columns if not (drop_text and c.lower() == "text")]
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=read_columns):
+            batch_df = lower_columns(batch.to_pandas())
+            batch_df["mostimportantdateutc"] = pd.to_datetime(
+                batch_df["mostimportantdateutc"], errors="coerce"
+            )
+            linked_slice = linked_meta.iloc[row_offset : row_offset + len(batch_df)].reset_index(
+                drop=True
+            )
+            for col in link_cols:
+                batch_df[col] = linked_slice[col].to_numpy()
+            row_offset += len(batch_df)
+
+            table = pa.Table.from_pandas(batch_df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temp_path, schema_with_promoted_nulls(table.schema, batch_df)
+                )
+            table = table.cast(writer.schema, safe=False)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    temp_path.replace(output_path)
+    row_count = len(linked_meta)
+    gvkey_matched = int(linked_meta["gvkey"].notna().sum())
+    permno_nonmissing = int(linked_meta["permno"].notna().sum())
+    return {
+        "rows": row_count,
+        "gvkey_matched_rows": gvkey_matched,
+        "gvkey_match_pct": pct(gvkey_matched, row_count),
+        "permno_nonmissing_rows": permno_nonmissing,
+        "permno_nonmissing_pct": pct(permno_nonmissing, row_count),
+    }
+
+
 def pct(numerator: int, denominator: int) -> float:
     return round(100 * numerator / denominator, 2) if denominator else 0.0
 
 
-def write_summary(output_dir: Path, outputs: dict[str, pd.DataFrame]) -> None:
-    summary = {}
-    for name, df in outputs.items():
-        row_count = len(df)
-        item = {"rows": row_count}
-        if "gvkey" in df.columns:
-            matched = int(df["gvkey"].notna().sum())
-            item["gvkey_matched_rows"] = matched
-            item["gvkey_match_pct"] = pct(matched, row_count)
-        if "permno" in df.columns:
-            matched = int(df["permno"].notna().sum())
-            item["permno_nonmissing_rows"] = matched
-            item["permno_nonmissing_pct"] = pct(matched, row_count)
-        if "compustat_match" in df.columns:
-            matched = int(df["compustat_match"].fillna(False).sum())
-            item["compustat_matched_rows"] = matched
-            item["compustat_match_pct"] = pct(matched, row_count)
-        summary[name] = item
+def build_summary_item(
+    df: pd.DataFrame,
+    crsp_input_path: Path,
+    deduplicated_crsp_used: bool,
+) -> dict[str, int | float | str | bool]:
+    row_count = len(df)
+    item = {
+        "rows": row_count,
+        "crsp_input_path": str(crsp_input_path),
+        "deduplicated_crsp_used": deduplicated_crsp_used,
+    }
+    if "gvkey" in df.columns:
+        matched = int(df["gvkey"].notna().sum())
+        item["gvkey_matched_rows"] = matched
+        item["gvkey_match_pct"] = pct(matched, row_count)
+    if "permno" in df.columns:
+        matched = int(df["permno"].notna().sum())
+        item["permno_nonmissing_rows"] = matched
+        item["permno_nonmissing_pct"] = pct(matched, row_count)
+    if "compustat_match" in df.columns:
+        matched = int(df["compustat_match"].fillna(False).sum())
+        item["compustat_matched_rows"] = matched
+        item["compustat_match_pct"] = pct(matched, row_count)
+    return item
 
+
+def add_crsp_input_metadata(
+    item: dict[str, int | float | str | bool],
+    crsp_input_path: Path,
+    deduplicated_crsp_used: bool,
+) -> dict[str, int | float | str | bool]:
+    item["crsp_input_path"] = str(crsp_input_path)
+    item["deduplicated_crsp_used"] = deduplicated_crsp_used
+    return item
+
+
+def write_summary(output_dir: Path, summary: dict[str, dict[str, int | float | str | bool]]) -> None:
     with (output_dir / "link_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
 
@@ -472,29 +668,43 @@ def write_summary(output_dir: Path, outputs: dict[str, pd.DataFrame]) -> None:
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    deduplicated_crsp_used = args.crsp_path.resolve() == DEFAULT_CRSP.resolve()
 
     print("Loading CCM links...", flush=True)
     ccm = prepare_ccm(args.ccm_path)
     print(f"Loaded {len(ccm):,} CCM links.", flush=True)
 
-    print("Loading monthly CRSP targets...", flush=True)
+    print(f"Loading monthly CRSP targets from {args.crsp_path}...", flush=True)
     crsp = load_crsp(args.crsp_path)
     print(f"Loaded {len(crsp):,} CRSP rows. Linking CRSP to gvkey...", flush=True)
     crsp_with_gvkey = link_by_permno_date(crsp, ccm, "permno", "mthcaldt")
     crsp_with_gvkey.to_parquet(args.output_dir / "crsp_with_gvkey.parquet", index=False)
     print("Wrote crsp_with_gvkey.parquet.", flush=True)
+    summary = {
+        "crsp_with_gvkey": build_summary_item(
+            crsp_with_gvkey,
+            crsp_input_path=args.crsp_path,
+            deduplicated_crsp_used=deduplicated_crsp_used,
+        )
+    }
 
     print("Loading Compustat firm characteristics...", flush=True)
     comp = load_compustat(args.compustat_path, args.compustat_cols)
     print(f"Loaded {len(comp):,} Compustat rows. Building lagged panel...", flush=True)
-    panel = build_compustat_panel(
+    panel_summary = write_compustat_panel(
+        args.output_dir / "crsp_compustat_panel.parquet",
         crsp_with_gvkey,
         comp,
         lag_months=args.compustat_lag_months,
         max_age_days=args.max_compustat_age_days,
     )
-    panel.to_parquet(args.output_dir / "crsp_compustat_panel.parquet", index=False)
+    summary["crsp_compustat_panel"] = add_crsp_input_metadata(
+        panel_summary,
+        crsp_input_path=args.crsp_path,
+        deduplicated_crsp_used=deduplicated_crsp_used,
+    )
     print("Wrote crsp_compustat_panel.parquet.", flush=True)
+    del crsp, crsp_with_gvkey
 
     print("Linking SEC 10-K filings by CIK, then to CCM...", flush=True)
     sec_10k = link_sec_10k(
@@ -506,22 +716,31 @@ def main() -> None:
     )
     sec_10k.to_parquet(args.output_dir / "sec_10k_with_links.parquet", index=False)
     print("Wrote sec_10k_with_links.parquet.", flush=True)
+    summary["sec_10k_with_links"] = build_summary_item(
+        sec_10k,
+        crsp_input_path=args.crsp_path,
+        deduplicated_crsp_used=deduplicated_crsp_used,
+    )
+    del sec_10k, comp
 
     print("Linking earnings calls by PERMNO to CCM...", flush=True)
-    calls = link_calls(args.calls_path, ccm, drop_text=args.drop_text)
-    calls.to_parquet(args.output_dir / "earnings_calls_with_gvkey.parquet", index=False)
+    calls_summary = write_calls_with_gvkey(
+        args.calls_path,
+        args.output_dir / "earnings_calls_with_gvkey.parquet",
+        ccm,
+        drop_text=args.drop_text,
+    )
     print("Wrote earnings_calls_with_gvkey.parquet.", flush=True)
+    summary["earnings_calls_with_gvkey"] = add_crsp_input_metadata(
+        calls_summary,
+        crsp_input_path=args.crsp_path,
+        deduplicated_crsp_used=deduplicated_crsp_used,
+    )
 
-    outputs = {
-        "crsp_with_gvkey": crsp_with_gvkey,
-        "crsp_compustat_panel": panel,
-        "sec_10k_with_links": sec_10k,
-        "earnings_calls_with_gvkey": calls,
-    }
-    write_summary(args.output_dir, outputs)
+    write_summary(args.output_dir, summary)
 
-    for name, df in outputs.items():
-        print(f"{name}: {len(df):,} rows")
+    for name, item in summary.items():
+        print(f"{name}: {item['rows']:,} rows")
     print(f"Wrote linked outputs to {args.output_dir}")
 
 
