@@ -142,6 +142,94 @@ imputed by same-month cross-sectional median. Months where an accounting
 feature is entirely missing are logged and left missing so a later train/test
 split can choose an out-of-sample-safe fallback.
 
+## Time-Based Modeling Splits
+
+Create reproducible train, validation, and test splits after the full feature
+panel has been built:
+
+```bash
+python scripts/06_create_splits.py
+```
+
+This reads `Dataset/Processed/model_panel_full_features.parquet` and writes
+`Dataset/Processed/model_panel_full_features_with_splits.parquet` without
+overwriting the unsplit full-feature panel. The modeling sample starts at
+January 1990 because Compustat feature selection was calibrated on the intended
+1990+ sample and earlier observations have weaker accounting coverage. The
+default chronological split is:
+
+- train: 1990-01-01 through 2010-12-31
+- validation: 2011-01-01 through 2015-12-31
+- test: 2016-01-01 through 2024-11-30
+
+Random splitting is inappropriate for this financial forecasting setting
+because it would mix future market regimes and future firm observations into
+model development, overstating out-of-sample performance. The split script
+therefore preserves calendar order, validates non-overlapping date windows,
+checks for duplicate `PERMNO`/`MthCalDt` rows and missing targets, and writes
+diagnostics under `outputs/sanity_checks/tables/` and
+`outputs/sanity_checks/plots/`.
+
+## Baseline Prediction Models
+
+Train the first regression and classification baselines on the time-split
+panel with:
+
+```bash
+python scripts/07_train_baselines.py
+```
+
+For a fast smoke test, run:
+
+```bash
+python scripts/07_train_baselines.py --debug
+```
+
+If the histogram gradient boosting grid is too slow for an initial full pass,
+run:
+
+```bash
+python scripts/07_train_baselines.py --skip-boosting
+```
+
+The baseline script reads
+`Dataset/Processed/model_panel_full_features_with_splits.parquet`, uses only
+predictive feature groups from `outputs/sanity_checks/tables/feature_groups.json`,
+and excludes identifiers, dates, raw targets, raw contemporaneous returns
+(`mthret`, `sprtrn`), helper columns, and text fields. Linear models use a
+train-fitted median imputer and train-fitted standard scaler; validation and
+test data are never used to fit preprocessing parameters or select
+hyperparameters.
+
+Implemented baselines are naive 12-month momentum, naive one-month reversal,
+Ridge regression, Elastic Net regression, histogram gradient boosting
+regression, logistic-loss classification, and histogram gradient boosting
+classification. Regression models predict `target_ret_1m` directly.
+Classification models predict `top_bottom_label`, where `0` is the bottom
+future-return quintile, `1` is the middle 60%, and `2` is the top future-return
+quintile. For portfolio ranking, classifier scores are computed as
+`P(top quintile) - P(bottom quintile)`.
+
+Model selection uses validation mean monthly rank IC, computed as the
+cross-sectional Spearman correlation between the model score and
+`target_ret_1m` within each month, then averaged across validation months. The
+script also reports MSE, MAE, Pearson and Spearman correlations, directional
+accuracy, classification accuracy, balanced accuracy, macro F1, top/bottom
+precision and recall, confusion matrices, and monthly rank IC series.
+
+Outputs are written to:
+
+- `outputs/predictions/baseline_predictions.parquet`
+- `outputs/tables/baseline_regression_metrics.csv`
+- `outputs/tables/baseline_classifier_metrics.csv`
+- `outputs/tables/baseline_model_selection_summary.csv`
+- `outputs/tables/baseline_selected_hyperparameters.csv`
+- `outputs/tables/baseline_monthly_rank_ic.csv`
+- `outputs/tables/baseline_classifier_confusion_matrices.csv`
+- `outputs/tables/baseline_feature_list.csv`
+- `outputs/models/baselines/`
+- `outputs/figures/`
+
 ## Raw Parquet Conversion
 
 To mirror the raw predictor and target datasets as parquet files, run:
