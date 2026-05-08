@@ -192,6 +192,31 @@ run:
 python scripts/07_train_baselines.py --skip-boosting
 ```
 
+Boosting can also be run later as a separate RCP job and merged back into the
+baseline prediction file:
+
+```bash
+RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> scripts/run_boosting_rcp.sh
+```
+
+The RCP wrapper mounts only the home PVC, writes
+`outputs/logs/boosting_job.log`, runs
+`scripts/07_train_baselines.py --only-boosting --merge-boosting`, saves
+`outputs/predictions/boosting_predictions.parquet`, and creates
+`outputs/predictions/baseline_predictions_with_boosting.parquet`. If the full
+train split is too slow, submit a fixed training subsample while still scoring
+all rows:
+
+```bash
+RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> MAX_TRAIN_ROWS=500000 scripts/run_boosting_rcp.sh
+```
+
+The merge step can also be rerun locally:
+
+```bash
+python scripts/07_train_baselines.py --merge-boosting
+```
+
 The baseline script reads
 `Dataset/Processed/model_panel_full_features_with_splits.parquet`, uses only
 predictive feature groups from `outputs/sanity_checks/tables/feature_groups.json`,
@@ -220,8 +245,12 @@ precision and recall, confusion matrices, and monthly rank IC series.
 Outputs are written to:
 
 - `outputs/predictions/baseline_predictions.parquet`
+- `outputs/predictions/boosting_predictions.parquet`
+- `outputs/predictions/baseline_predictions_with_boosting.parquet`
 - `outputs/tables/baseline_regression_metrics.csv`
 - `outputs/tables/baseline_classifier_metrics.csv`
+- `outputs/tables/boosting_model_metrics.csv`
+- `outputs/tables/boosting_selected_hyperparameters.csv`
 - `outputs/tables/baseline_model_selection_summary.csv`
 - `outputs/tables/baseline_selected_hyperparameters.csv`
 - `outputs/tables/baseline_monthly_rank_ic.csv`

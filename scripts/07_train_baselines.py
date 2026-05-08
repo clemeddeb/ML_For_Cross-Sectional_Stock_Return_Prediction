@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -40,9 +41,12 @@ RANDOM_SEED = 362559
 DEFAULT_INPUT = Path("Dataset/Processed/model_panel_full_features_with_splits.parquet")
 DEFAULT_FEATURE_GROUPS = Path("outputs/sanity_checks/tables/feature_groups.json")
 DEFAULT_PREDICTIONS = Path("outputs/predictions/baseline_predictions.parquet")
+DEFAULT_BOOSTING_PREDICTIONS = Path("outputs/predictions/boosting_predictions.parquet")
+DEFAULT_MERGED_PREDICTIONS = Path("outputs/predictions/baseline_predictions_with_boosting.parquet")
 DEFAULT_TABLE_DIR = Path("outputs/tables")
 DEFAULT_MODEL_DIR = Path("outputs/models/baselines")
 DEFAULT_FIGURE_DIR = Path("outputs/figures")
+DEFAULT_BOOSTING_LOG = Path("outputs/logs/boosting_job.log")
 
 ID_COLUMNS = ["permno", "gvkey", "mthcaldt", "split"]
 TARGET_COLUMNS = ["target_ret_1m", "target_quintile", "top_bottom_label"]
@@ -92,11 +96,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Use a small deterministic sample.")
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--skip-boosting", action="store_true")
+    parser.add_argument("--only-boosting", action="store_true")
+    parser.add_argument("--merge-boosting", action="store_true")
+    parser.add_argument("--boosting-predictions-output", type=Path, default=DEFAULT_BOOSTING_PREDICTIONS)
+    parser.add_argument("--merged-predictions-output", type=Path, default=DEFAULT_MERGED_PREDICTIONS)
+    parser.add_argument("--boosting-log", type=Path, default=DEFAULT_BOOSTING_LOG)
     return parser.parse_args()
 
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+class Tee:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> None:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_boosting_log(path: Path) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, handle)
+    sys.stderr = Tee(sys.stderr, handle)
+    log(f"Logging boosting run to {path}")
+    return handle
 
 
 def load_feature_groups(path: Path) -> dict[str, list[str]]:
@@ -396,6 +428,28 @@ def fit_gb_reg_grid(
     return best_model, best_params, rows
 
 
+def boosting_prediction_frame(panel: pd.DataFrame) -> pd.DataFrame:
+    predictions = panel[ID_COLUMNS + TARGET_COLUMNS].copy()
+    return predictions.rename(columns={"permno": "PERMNO", "mthcaldt": "MthCalDt"})
+
+
+def boosting_model_columns() -> dict[str, str]:
+    return {
+        "gradient_boosting_reg": "prediction_gradient_boosting_reg",
+        "gb_classifier": "prediction_gb_classifier_score",
+    }
+
+
+def boosting_classifier_columns() -> dict[str, dict[str, str]]:
+    return {
+        "gb_classifier": {
+            "bottom": "prob_gb_bottom",
+            "middle": "prob_gb_middle",
+            "top": "prob_gb_top",
+        }
+    }
+
+
 def fit_gb_clf_grid(
     x_train: pd.DataFrame, y_train: np.ndarray, val_df: pd.DataFrame, x_val: pd.DataFrame, debug: bool
 ) -> tuple[HistGradientBoostingClassifier, dict[str, Any], list[dict[str, Any]]]:
@@ -601,6 +655,21 @@ def selected_hyperparameters_table(selected_params: dict[str, dict[str, Any]], g
     return pd.DataFrame(rows)
 
 
+def boosting_metrics_table(predictions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    monthly_ic = monthly_rank_ic_table(predictions, boosting_model_columns())
+    reg = add_rank_ic_summaries(regression_metrics(predictions, boosting_model_columns()), monthly_ic)
+    clf, confusion = classifier_metrics_and_confusion(predictions, boosting_classifier_columns())
+    clf = add_rank_ic_summaries(clf, monthly_ic)
+    if not reg.empty:
+        reg = reg.assign(metric_family="regression_or_ranking")
+    if not clf.empty:
+        clf = clf.assign(metric_family="classification")
+    metrics = pd.concat([reg, clf], ignore_index=True, sort=False)
+    leading = ["metric_family", "model", "split", "rows"]
+    ordered = leading + [column for column in metrics.columns if column not in leading]
+    return metrics[ordered], monthly_ic, confusion
+
+
 def plot_rank_ic_bar(summary: pd.DataFrame, split: str, path: Path) -> None:
     column = f"{split}_monthly_rank_ic"
     data = summary.dropna(subset=[column]).sort_values(column)
@@ -697,13 +766,182 @@ def clear_skipped_boosting_artifacts(model_dir: Path) -> None:
     )
 
 
+def run_only_boosting(
+    args: argparse.Namespace,
+    panel: pd.DataFrame,
+    feature_list: list[str],
+    train_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+) -> None:
+    y_train_reg = train_df["target_ret_1m"].to_numpy(dtype="float64")
+    y_train_clf = train_df["top_bottom_label"].astype(int).to_numpy()
+    selected_params: dict[str, dict[str, Any]] = {}
+    grid_rows: list[dict[str, Any]] = []
+
+    log("Selecting histogram gradient boosting regressor by validation monthly rank IC...")
+    gb_reg, gb_reg_params, rows = fit_gb_reg_grid(
+        train_df[feature_list],
+        y_train_reg,
+        validation_df,
+        validation_df[feature_list],
+        args.debug,
+    )
+    selected_params["gradient_boosting_reg"] = gb_reg_params
+    grid_rows.extend(rows)
+
+    log("Selecting histogram gradient boosting classifier by validation monthly rank IC...")
+    gb_clf, gb_clf_params, rows = fit_gb_clf_grid(
+        train_df[feature_list],
+        y_train_clf,
+        validation_df,
+        validation_df[feature_list],
+        args.debug,
+    )
+    selected_params["gb_classifier"] = gb_clf_params
+    grid_rows.extend(rows)
+
+    log("Generating boosting predictions for all splits...")
+    predictions = boosting_prediction_frame(panel)
+    predictions["prediction_gradient_boosting_reg"] = gb_reg.predict(panel[feature_list])
+    probs = class_probabilities(gb_clf, panel[feature_list])
+    predictions["prob_gb_bottom"] = probs[:, 0]
+    predictions["prob_gb_middle"] = probs[:, 1]
+    predictions["prob_gb_top"] = probs[:, 2]
+    predictions["prediction_gb_classifier_score"] = probs[:, 2] - probs[:, 0]
+
+    if predictions.duplicated(["PERMNO", "MthCalDt"]).any():
+        raise ValueError("Boosting prediction output has duplicate PERMNO-MthCalDt rows.")
+    prediction_columns = [
+        "prediction_gradient_boosting_reg",
+        "prediction_gb_classifier_score",
+        "prob_gb_bottom",
+        "prob_gb_middle",
+        "prob_gb_top",
+    ]
+    missing = predictions.loc[predictions["split"].isin(["validation", "test"]), prediction_columns].isna().sum()
+    if int(missing.sum()):
+        raise ValueError(f"Boosting validation/test predictions contain missing values:\n{missing}")
+
+    metrics, monthly_ic, confusion = boosting_metrics_table(predictions)
+    hyperparams = selected_hyperparameters_table(selected_params, grid_rows)
+
+    args.boosting_predictions_output.parent.mkdir(parents=True, exist_ok=True)
+    predictions.to_parquet(args.boosting_predictions_output, index=False)
+    metrics.to_csv(args.table_dir / "boosting_model_metrics.csv", index=False)
+    hyperparams.to_csv(args.table_dir / "boosting_selected_hyperparameters.csv", index=False)
+    monthly_ic.to_csv(args.table_dir / "boosting_monthly_rank_ic.csv", index=False)
+    confusion.to_csv(args.table_dir / "boosting_classifier_confusion_matrices.csv", index=False)
+    joblib.dump(gb_reg, args.model_dir / "gradient_boosting_regressor.joblib")
+    joblib.dump(gb_clf, args.model_dir / "gradient_boosting_classifier.joblib")
+    skipped_marker = args.model_dir / "gradient_boosting_skipped.json"
+    if skipped_marker.exists():
+        skipped_marker.unlink()
+    (args.model_dir / "boosting_selected_hyperparameters.json").write_text(
+        json.dumps(selected_params, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    validation = metrics.loc[
+        metrics["split"].eq("validation") & metrics["monthly_rank_ic_mean"].notna(),
+        ["model", "metric_family", "monthly_rank_ic_mean"],
+    ]
+    log("Boosting validation monthly rank IC:")
+    for row in validation.to_dict(orient="records"):
+        log(f"- {row['model']} ({row['metric_family']}): {row['monthly_rank_ic_mean']:.6f}")
+    log(f"Wrote boosting predictions: {args.boosting_predictions_output}")
+    log(f"Wrote boosting metrics: {args.table_dir / 'boosting_model_metrics.csv'}")
+
+
+def merge_boosting_predictions(
+    baseline_path: Path,
+    boosting_path: Path,
+    output_path: Path,
+) -> None:
+    if not baseline_path.exists():
+        raise FileNotFoundError(f"Baseline predictions not found: {baseline_path}")
+    if not boosting_path.exists():
+        raise FileNotFoundError(f"Boosting predictions not found: {boosting_path}")
+    log(f"Loading baseline predictions: {baseline_path}")
+    baseline = pd.read_parquet(baseline_path)
+    log(f"Loading boosting predictions: {boosting_path}")
+    boosting = pd.read_parquet(boosting_path)
+    keys = ["PERMNO", "MthCalDt"]
+    if baseline.duplicated(keys).any():
+        raise ValueError("Baseline predictions have duplicate PERMNO-MthCalDt rows.")
+    if boosting.duplicated(keys).any():
+        raise ValueError("Boosting predictions have duplicate PERMNO-MthCalDt rows.")
+    check_columns = ["split", "target_ret_1m", "target_quintile", "top_bottom_label"]
+    merged = baseline.merge(
+        boosting[keys + check_columns + [
+            "prediction_gradient_boosting_reg",
+            "prediction_gb_classifier_score",
+            "prob_gb_bottom",
+            "prob_gb_middle",
+            "prob_gb_top",
+        ]],
+        on=keys,
+        how="left",
+        suffixes=("", "_boosting"),
+        validate="one_to_one",
+    )
+    if len(merged) != len(baseline):
+        raise ValueError(f"Merged row count changed: {len(baseline):,} -> {len(merged):,}")
+    for column in check_columns:
+        comparison = merged[column].astype(str).eq(merged[f"{column}_boosting"].astype(str))
+        if not bool(comparison.all()):
+            raise ValueError(f"Baseline and boosting predictions disagree on {column}.")
+        merged = merged.drop(columns=[f"{column}_boosting"])
+    for column in [
+        "prediction_gradient_boosting_reg",
+        "prediction_gb_classifier_score",
+        "prob_gb_bottom",
+        "prob_gb_middle",
+        "prob_gb_top",
+    ]:
+        boosting_column = f"{column}_boosting"
+        if boosting_column in merged.columns:
+            merged[column] = merged[boosting_column]
+            merged = merged.drop(columns=[boosting_column])
+    missing = merged.loc[
+        merged["split"].isin(["validation", "test"]),
+        [
+            "prediction_gradient_boosting_reg",
+            "prediction_gb_classifier_score",
+            "prob_gb_bottom",
+            "prob_gb_middle",
+            "prob_gb_top",
+        ],
+    ].isna().sum()
+    if int(missing.sum()):
+        raise ValueError(f"Merged boosting columns contain missing validation/test values:\n{missing}")
+    if merged.duplicated(keys).any():
+        raise ValueError("Merged predictions have duplicate PERMNO-MthCalDt rows.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(output_path, index=False)
+    log(f"Wrote merged predictions: {output_path}")
+
+
 def main() -> None:
     args = parse_args()
+    if args.only_boosting and args.skip_boosting:
+        raise ValueError("--only-boosting and --skip-boosting cannot be used together.")
     np.random.seed(RANDOM_SEED)
     args.predictions_output.parent.mkdir(parents=True, exist_ok=True)
+    args.boosting_predictions_output.parent.mkdir(parents=True, exist_ok=True)
+    args.merged_predictions_output.parent.mkdir(parents=True, exist_ok=True)
     args.table_dir.mkdir(parents=True, exist_ok=True)
     args.model_dir.mkdir(parents=True, exist_ok=True)
     args.figure_dir.mkdir(parents=True, exist_ok=True)
+    log_handle = None
+    if args.only_boosting or args.merge_boosting:
+        log_handle = setup_boosting_log(args.boosting_log)
+
+    if args.merge_boosting and not args.only_boosting:
+        merge_boosting_predictions(
+            args.predictions_output,
+            args.boosting_predictions_output,
+            args.merged_predictions_output,
+        )
+        return
 
     groups = load_feature_groups(args.feature_groups)
     all_columns = pq.ParquetFile(args.input).schema_arrow.names
@@ -722,6 +960,17 @@ def main() -> None:
         log(f"Using {len(fit_train_idx):,} sampled train rows for fitting out of {len(train_idx):,}.")
     train_df = panel.loc[fit_train_idx]
     validation_df = panel.loc[panel["split"].eq("validation")]
+
+    if args.only_boosting:
+        run_only_boosting(args, panel, feature_list, train_df, validation_df)
+        if args.merge_boosting:
+            merge_boosting_predictions(
+                args.predictions_output,
+                args.boosting_predictions_output,
+                args.merged_predictions_output,
+            )
+        return
+
     y_train_reg = train_df["target_ret_1m"].to_numpy(dtype="float64")
     y_train_clf = train_df["top_bottom_label"].astype(int).to_numpy()
 
