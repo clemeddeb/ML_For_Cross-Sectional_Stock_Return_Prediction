@@ -79,6 +79,69 @@ month using realized `target_ret_1m`: quintile 1 is the bottom quintile,
 quintile 5 is the top quintile, and `top_bottom_label` maps bottom/middle/top
 to `0/1/2`. The target is not used to create predictors.
 
+## Return Feature Panel
+
+Add return-based predictors to the monthly modeling panel with:
+
+```bash
+python scripts/03_build_return_features.py
+```
+
+This reads `Dataset/Processed/model_panel_monthly_base.parquet` and writes
+`Dataset/Processed/model_panel_with_return_features.parquet` without
+overwriting the base panel. The script creates stock-level lagged returns,
+6-month and 12-month momentum, 12-month and 24-month volatility, lagged S&P
+500 market return, lagged excess return, and a 24-month rolling beta. All stock
+rolling windows are computed within `PERMNO` and are shifted so the row dated
+month `t` only uses returns from months before `t`; `target_ret_1m` is not
+passed into the feature builder. Sanity outputs are written to
+`outputs/sanity_checks/tables/` and coverage plots to
+`outputs/sanity_checks/plots/`.
+
+## JKP Factor-State Panel
+
+Add date-level JKP factor-state predictors after building the return-feature
+panel:
+
+```bash
+python scripts/04_add_jkp_features.py
+```
+
+This locates the long-format JKP factor-return parquet file, reshapes selected
+monthly factors from long to wide, and writes
+`Dataset/Processed/model_panel_with_return_jkp_features.parquet`. JKP is merged
+by normalized month date only, not by firm identifier, because these are
+market-wide factor portfolio returns. For each selected factor, the script adds
+lagged one-month return, 12-month cumulative factor momentum, and 12-month
+factor volatility using only factor returns from months before the panel row's
+month. Schema, selected-feature, missingness, date-coverage, and coverage-plot
+outputs are saved under `outputs/sanity_checks/`.
+
+## Full Feature Panel
+
+Select and clean Compustat accounting predictors after adding return and JKP
+features:
+
+```bash
+python scripts/05_select_compustat_features.py
+```
+
+This reads `Dataset/Processed/model_panel_with_return_jkp_features.parquet` and
+writes `Dataset/Processed/model_panel_full_features.parquet`. The script keeps
+identifiers, targets, raw returns, return predictors, and JKP predictors, but
+does not pass all raw Compustat columns into models. Instead, it excludes
+identifier, date, text, categorical, and linking-helper fields; computes
+feature-selection missingness on the intended modeling period, defaulting to
+1990 onward rather than the full 1949-2024 history; and keeps numeric
+accounting candidates with less than 60% missingness in that modeling window.
+The script prefers economically interpretable ratios and transformed scale
+features over raw accounting levels, because raw levels are dominated by firm
+size and are less comparable across firms. Selected accounting variables are
+winsorized cross-sectionally by `MthCalDt` at the 1st and 99th percentiles and
+imputed by same-month cross-sectional median. Months where an accounting
+feature is entirely missing are logged and left missing so a later train/test
+split can choose an out-of-sample-safe fallback.
+
 ## Raw Parquet Conversion
 
 To mirror the raw predictor and target datasets as parquet files, run:
