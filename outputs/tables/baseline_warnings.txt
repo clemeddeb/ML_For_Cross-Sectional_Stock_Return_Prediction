@@ -1,0 +1,6 @@
+Gradient boosting models skipped via --skip-boosting.
+prediction_gradient_boosting_reg is missing because its model was skipped.
+prediction_gb_classifier_score is missing because its model was skipped.
+prob_gb_bottom is missing because its model was skipped.
+prob_gb_middle is missing because its model was skipped.
+prob_gb_top is missing because its model was skipped.

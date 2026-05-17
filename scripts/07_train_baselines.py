@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-boosting", action="store_true")
     parser.add_argument("--only-boosting", action="store_true")
     parser.add_argument("--merge-boosting", action="store_true")
+    parser.add_argument(
+        "--boosting-backend",
+        choices=["sklearn", "xgboost_gpu"],
+        default="sklearn",
+        help="Backend for boosting models. xgboost_gpu requires xgboost with CUDA support.",
+    )
     parser.add_argument("--boosting-predictions-output", type=Path, default=DEFAULT_BOOSTING_PREDICTIONS)
     parser.add_argument("--merged-predictions-output", type=Path, default=DEFAULT_MERGED_PREDICTIONS)
     parser.add_argument("--boosting-log", type=Path, default=DEFAULT_BOOSTING_LOG)
@@ -279,6 +285,17 @@ def class_probabilities(model: Any, x: np.ndarray) -> np.ndarray:
     return out
 
 
+def import_xgboost() -> tuple[Any, Any]:
+    try:
+        from xgboost import XGBClassifier, XGBRegressor
+    except ImportError as exc:
+        raise ImportError(
+            "xgboost is required for --boosting-backend xgboost_gpu. "
+            "Install it for the RCP Python and expose it through PYTHONPATH."
+        ) from exc
+    return XGBRegressor, XGBClassifier
+
+
 def fit_ridge_grid(x_train: np.ndarray, y_train: np.ndarray, val_df: pd.DataFrame, x_val: np.ndarray) -> tuple[Ridge, dict[str, Any], list[dict[str, Any]]]:
     rows = []
     best_model: Ridge | None = None
@@ -428,6 +445,59 @@ def fit_gb_reg_grid(
     return best_model, best_params, rows
 
 
+def fit_xgb_reg_grid(
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    val_df: pd.DataFrame,
+    x_val: pd.DataFrame,
+    debug: bool,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
+    XGBRegressor, _ = import_xgboost()
+    grid = (
+        [{"max_iter": 50, "learning_rate": 0.1, "max_leaf_nodes": 31}]
+        if debug
+        else [
+            {"max_iter": 100, "learning_rate": 0.03, "max_leaf_nodes": 31},
+            {"max_iter": 100, "learning_rate": 0.1, "max_leaf_nodes": 31},
+            {"max_iter": 300, "learning_rate": 0.03, "max_leaf_nodes": 31},
+            {"max_iter": 100, "learning_rate": 0.03, "max_leaf_nodes": 63},
+        ]
+    )
+    rows = []
+    best_model = None
+    best_params: dict[str, Any] = {}
+    best_ic = -np.inf
+    for params in grid:
+        model = XGBRegressor(
+            n_estimators=params["max_iter"],
+            learning_rate=params["learning_rate"],
+            max_leaves=params["max_leaf_nodes"],
+            max_depth=0,
+            grow_policy="lossguide",
+            tree_method="hist",
+            device="cuda",
+            objective="reg:squarederror",
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=RANDOM_SEED,
+            n_jobs=0,
+            eval_metric="rmse",
+        )
+        model.fit(x_train, y_train)
+        val_pred = model.predict(x_val)
+        ic = validation_rank_ic(val_df, val_pred)
+        row = {"model": "gradient_boosting_reg", "backend": "xgboost_gpu", "validation_monthly_rank_ic": ic}
+        row.update(params)
+        rows.append(row)
+        if ic > best_ic:
+            best_ic = ic
+            best_model = model
+            best_params = params.copy()
+            best_params["backend"] = "xgboost_gpu"
+    assert best_model is not None
+    return best_model, best_params, rows
+
+
 def boosting_prediction_frame(panel: pd.DataFrame) -> pd.DataFrame:
     predictions = panel[ID_COLUMNS + TARGET_COLUMNS].copy()
     return predictions.rename(columns={"permno": "PERMNO", "mthcaldt": "MthCalDt"})
@@ -480,6 +550,61 @@ def fit_gb_clf_grid(
             best_ic = ic
             best_model = model
             best_params = params.copy()
+    assert best_model is not None
+    return best_model, best_params, rows
+
+
+def fit_xgb_clf_grid(
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    val_df: pd.DataFrame,
+    x_val: pd.DataFrame,
+    debug: bool,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
+    _, XGBClassifier = import_xgboost()
+    grid = (
+        [{"max_iter": 50, "learning_rate": 0.1, "max_leaf_nodes": 31}]
+        if debug
+        else [
+            {"max_iter": 100, "learning_rate": 0.03, "max_leaf_nodes": 31},
+            {"max_iter": 100, "learning_rate": 0.1, "max_leaf_nodes": 31},
+            {"max_iter": 300, "learning_rate": 0.03, "max_leaf_nodes": 31},
+            {"max_iter": 100, "learning_rate": 0.03, "max_leaf_nodes": 63},
+        ]
+    )
+    rows = []
+    best_model = None
+    best_params: dict[str, Any] = {}
+    best_ic = -np.inf
+    for params in grid:
+        model = XGBClassifier(
+            n_estimators=params["max_iter"],
+            learning_rate=params["learning_rate"],
+            max_leaves=params["max_leaf_nodes"],
+            max_depth=0,
+            grow_policy="lossguide",
+            tree_method="hist",
+            device="cuda",
+            objective="multi:softprob",
+            num_class=3,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=RANDOM_SEED,
+            n_jobs=0,
+            eval_metric="mlogloss",
+        )
+        model.fit(x_train, y_train)
+        probs = class_probabilities(model, x_val)
+        score = probs[:, 2] - probs[:, 0]
+        ic = validation_rank_ic(val_df, score)
+        row = {"model": "gb_classifier", "backend": "xgboost_gpu", "validation_monthly_rank_ic": ic}
+        row.update(params)
+        rows.append(row)
+        if ic > best_ic:
+            best_ic = ic
+            best_model = model
+            best_params = params.copy()
+            best_params["backend"] = "xgboost_gpu"
     assert best_model is not None
     return best_model, best_params, rows
 
@@ -778,25 +903,43 @@ def run_only_boosting(
     selected_params: dict[str, dict[str, Any]] = {}
     grid_rows: list[dict[str, Any]] = []
 
-    log("Selecting histogram gradient boosting regressor by validation monthly rank IC...")
-    gb_reg, gb_reg_params, rows = fit_gb_reg_grid(
-        train_df[feature_list],
-        y_train_reg,
-        validation_df,
-        validation_df[feature_list],
-        args.debug,
-    )
+    log(f"Selecting boosting regressor by validation monthly rank IC using {args.boosting_backend}...")
+    if args.boosting_backend == "xgboost_gpu":
+        gb_reg, gb_reg_params, rows = fit_xgb_reg_grid(
+            train_df[feature_list],
+            y_train_reg,
+            validation_df,
+            validation_df[feature_list],
+            args.debug,
+        )
+    else:
+        gb_reg, gb_reg_params, rows = fit_gb_reg_grid(
+            train_df[feature_list],
+            y_train_reg,
+            validation_df,
+            validation_df[feature_list],
+            args.debug,
+        )
     selected_params["gradient_boosting_reg"] = gb_reg_params
     grid_rows.extend(rows)
 
-    log("Selecting histogram gradient boosting classifier by validation monthly rank IC...")
-    gb_clf, gb_clf_params, rows = fit_gb_clf_grid(
-        train_df[feature_list],
-        y_train_clf,
-        validation_df,
-        validation_df[feature_list],
-        args.debug,
-    )
+    log(f"Selecting boosting classifier by validation monthly rank IC using {args.boosting_backend}...")
+    if args.boosting_backend == "xgboost_gpu":
+        gb_clf, gb_clf_params, rows = fit_xgb_clf_grid(
+            train_df[feature_list],
+            y_train_clf,
+            validation_df,
+            validation_df[feature_list],
+            args.debug,
+        )
+    else:
+        gb_clf, gb_clf_params, rows = fit_gb_clf_grid(
+            train_df[feature_list],
+            y_train_clf,
+            validation_df,
+            validation_df[feature_list],
+            args.debug,
+        )
     selected_params["gb_classifier"] = gb_clf_params
     grid_rows.extend(rows)
 
@@ -1018,17 +1161,27 @@ def main() -> None:
             }
         )
     else:
-        log("Selecting histogram gradient boosting regressor by validation monthly rank IC...")
-        gb_reg, gb_reg_params, rows = fit_gb_reg_grid(
-            train_df[feature_list], y_train_reg, validation_df, validation_df[feature_list], args.debug
-        )
+        log(f"Selecting boosting regressor by validation monthly rank IC using {args.boosting_backend}...")
+        if args.boosting_backend == "xgboost_gpu":
+            gb_reg, gb_reg_params, rows = fit_xgb_reg_grid(
+                train_df[feature_list], y_train_reg, validation_df, validation_df[feature_list], args.debug
+            )
+        else:
+            gb_reg, gb_reg_params, rows = fit_gb_reg_grid(
+                train_df[feature_list], y_train_reg, validation_df, validation_df[feature_list], args.debug
+            )
         selected_params["gradient_boosting_reg"] = gb_reg_params
         grid_rows.extend(rows)
 
-        log("Selecting histogram gradient boosting classifier by validation monthly rank IC...")
-        gb_clf, gb_clf_params, rows = fit_gb_clf_grid(
-            train_df[feature_list], y_train_clf, validation_df, validation_df[feature_list], args.debug
-        )
+        log(f"Selecting boosting classifier by validation monthly rank IC using {args.boosting_backend}...")
+        if args.boosting_backend == "xgboost_gpu":
+            gb_clf, gb_clf_params, rows = fit_xgb_clf_grid(
+                train_df[feature_list], y_train_clf, validation_df, validation_df[feature_list], args.debug
+            )
+        else:
+            gb_clf, gb_clf_params, rows = fit_gb_clf_grid(
+                train_df[feature_list], y_train_clf, validation_df, validation_df[feature_list], args.debug
+            )
         selected_params["gb_classifier"] = gb_clf_params
         grid_rows.extend(rows)
 

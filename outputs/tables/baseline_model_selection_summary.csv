@@ -1,0 +1,6 @@
+model,test_monthly_rank_ic,validation_monthly_rank_ic,selected,best_by_validation_rank_ic
+logistic_classifier,0.06689603858532,0.0728576114278665,True,True
+naive_momentum,0.0463532295319023,0.072617041116685,True,False
+elastic_net,0.0023483646744808,0.0002857719213187,True,False
+ridge,-0.0003848133274216,-0.0179910381937389,True,False
+naive_reversal,-0.0216458704867661,-0.0306853683299134,True,False

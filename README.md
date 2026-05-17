@@ -211,10 +211,37 @@ all rows:
 RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> MAX_TRAIN_ROWS=500000 scripts/run_boosting_rcp.sh
 ```
 
+To run GPU-accelerated XGBoost from the RCP image without a custom Docker
+image, first install XGBoost for the image's Python version into the mounted
+home directory:
+
+```bash
+runai submit --name ml-finance-xgb-install --run-as-uid <your-numeric-uid> \
+  --image registry.rcp.epfl.ch/ee559/environment-with-packages:latest \
+  --gpu 0 --existing-pvc claimname=home,path=/home/<your-rcp-username> \
+  --command -- bash -lc 'python3 -m pip install --upgrade --target /home/<your-rcp-username>/.local/rcp-python312-site "xgboost>=2.1"'
+```
+
+Then submit the full XGBoost GPU baseline:
+
+```bash
+RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> \
+  BOOSTING_BACKEND=xgboost_gpu \
+  RCP_PYTHONPATH=/home/<your-rcp-username>/.local/rcp-python312-site \
+  RUNAI_JOB_NAME=ml-finance-xgb-full scripts/run_boosting_rcp.sh
+```
+
 The merge step can also be rerun locally:
 
 ```bash
 python scripts/07_train_baselines.py --merge-boosting
+```
+
+After baseline and boosting predictions have been merged, refresh the
+comparison figures without retraining:
+
+```bash
+python scripts/08_plot_baseline_comparison.py
 ```
 
 The baseline script reads
@@ -258,6 +285,12 @@ Outputs are written to:
 - `outputs/tables/baseline_feature_list.csv`
 - `outputs/models/baselines/`
 - `outputs/figures/`
+
+The repository is configured to allow committing the lightweight baseline
+tables and PNG figures under `outputs/tables/` and `outputs/figures/`.
+Large generated prediction parquet files and fitted model artifacts remain
+ignored; share those separately if another collaborator needs exact row-level
+scores or fitted objects.
 
 ## Raw Parquet Conversion
 

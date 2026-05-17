@@ -35,7 +35,30 @@ htmlcov/
 !.env.example
 
 # Generated artifacts
-outputs/
+outputs/*
+!outputs/tables/
+outputs/tables/*
+!outputs/tables/baseline_all_model_rank_ic_summary.csv
+!outputs/tables/baseline_classifier_confusion_matrices.csv
+!outputs/tables/baseline_classifier_metrics.csv
+!outputs/tables/baseline_feature_list.csv
+!outputs/tables/baseline_model_selection_summary.csv
+!outputs/tables/baseline_monthly_rank_ic.csv
+!outputs/tables/baseline_regression_metrics.csv
+!outputs/tables/baseline_selected_hyperparameters.csv
+!outputs/tables/baseline_warnings.txt
+!outputs/tables/boosting_classifier_confusion_matrices.csv
+!outputs/tables/boosting_model_metrics.csv
+!outputs/tables/boosting_monthly_rank_ic.csv
+!outputs/tables/boosting_selected_hyperparameters.csv
+!outputs/figures/
+outputs/figures/*
+!outputs/figures/classifier_confusion_matrix_test.png
+!outputs/figures/classifier_confusion_matrix_validation.png
+!outputs/figures/monthly_rank_ic_over_time.png
+!outputs/figures/prediction_distribution_by_model.png
+!outputs/figures/test_rank_ic_by_model.png
+!outputs/figures/validation_rank_ic_by_model.png
 output/
 results/
 models/
