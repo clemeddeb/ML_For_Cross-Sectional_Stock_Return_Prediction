@@ -20,7 +20,7 @@ DEFAULT_TABLE_DIR = Path("outputs/sanity_checks/tables")
 
 KEY_COLUMNS = ["permno", "mthcaldt"]
 IDENTIFIER_COLUMNS = ["permno", "gvkey", "mthcaldt", "ticker", "siccd", "naics"]
-TARGET_COLUMNS = ["target_ret_1m", "target_quintile", "top_bottom_label"]
+TARGET_COLUMNS = ["target_month", "target_ret_1m", "target_quintile", "top_bottom_label"]
 RAW_RETURN_COLUMNS = ["mthret", "sprtrn"]
 RETURN_FEATURE_COLUMNS = [
     "ret_lag_1m",
@@ -36,6 +36,8 @@ RETURN_FEATURE_COLUMNS = [
     "beta_24m",
 ]
 TARGET_COLUMN = "target_ret_1m"
+TRAIN_SELECTION_START = pd.Timestamp("1990-01-01")
+TRAIN_SELECTION_END = pd.Timestamp("2010-12-31")
 
 COMPUSTAT_IDENTIFIER_COLUMNS = {
     "comp_cik",
@@ -167,7 +169,7 @@ def build_all_compustat_like_table(
 def numeric_accounting_candidates(
     data: pd.DataFrame,
     compustat_columns: list[str],
-    model_mask: pd.Series,
+    selection_mask: pd.Series,
 ) -> tuple[pd.DataFrame, list[str]]:
     rows = []
     selected = []
@@ -179,15 +181,17 @@ def numeric_accounting_candidates(
         if numeric is None:
             model_numeric_nonmissing = pd.NA
             numeric_parse_rate = pd.NA
-            model_missing_pct = round(100 * series.loc[model_mask].isna().mean(), 4)
+            model_missing_pct = round(100 * series.loc[selection_mask].isna().mean(), 4)
             variance = pd.NA
             unique_values = pd.NA
             candidate = False
         else:
-            original_nonmissing = int(series.notna().sum())
-            numeric_nonmissing = int(numeric.notna().sum())
+            selection_series = series.loc[selection_mask]
+            selection_numeric = numeric.loc[selection_mask]
+            original_nonmissing = int(selection_series.notna().sum())
+            numeric_nonmissing = int(selection_numeric.notna().sum())
             numeric_parse_rate = numeric_nonmissing / original_nonmissing if original_nonmissing else 0.0
-            model_numeric = numeric.loc[model_mask]
+            model_numeric = selection_numeric
             model_numeric_nonmissing = int(model_numeric.notna().sum())
             model_missing_pct = round(100 * model_numeric.isna().mean(), 4) if len(model_numeric) else 100.0
             variance = model_numeric.var(skipna=True)
@@ -413,7 +417,7 @@ def redundant_columns(feature_data: pd.DataFrame, columns: list[str], mask: pd.S
 def select_engineered_features(
     feature_data: pd.DataFrame,
     ratio_status: pd.DataFrame,
-    model_mask: pd.Series,
+    selection_mask: pd.Series,
     train_diag_mask: pd.Series,
     missingness_threshold: float,
     near_zero_variance_threshold: float,
@@ -423,7 +427,7 @@ def select_engineered_features(
     selected = []
     for feature in feature_data.columns:
         values = feature_data[feature]
-        model_values = values.loc[model_mask]
+        model_values = values.loc[selection_mask]
         train_values = values.loc[train_diag_mask]
         missing_rate = model_values.isna().mean() if len(model_values) else 1.0
         variance = model_values.var(skipna=True)
@@ -469,7 +473,7 @@ def select_engineered_features(
             }
         )
 
-    redundant = redundant_columns(feature_data, selected, model_mask)
+    redundant = redundant_columns(feature_data, selected, selection_mask)
     if redundant:
         redundant_set = set(redundant)
         for row in rows:
@@ -721,13 +725,13 @@ def write_feature_groups(
         "excluded_columns": excluded_columns,
         "cleaning_rules": {
             "candidate_detection": "comp_* and compustat_* columns excluding identifiers, dates, categorical metadata, and linking helpers",
-            "feature_selection_window_start": args.modeling_start_date,
-            "train_only_diagnostic_end_date": args.train_diagnostic_end_date,
+            "feature_selection_window_start": TRAIN_SELECTION_START.date().isoformat(),
+            "feature_selection_window_end": TRAIN_SELECTION_END.date().isoformat(),
             "missingness_threshold": args.missingness_threshold,
             "near_zero_variance_threshold": args.near_zero_variance_threshold,
             "winsorization": f"cross-sectional by mthcaldt at {args.winsor_lower:.2%}/{args.winsor_upper:.2%}",
             "imputation": "cross-sectional median by mthcaldt; full-missing months remain missing",
-            "missing_indicators": f"added for up to {MAX_MISSING_INDICATORS} selected Compustat features with modeling-sample missingness >= {MISSING_INDICATOR_MIN_RATE:.0%}",
+            "missing_indicators": f"added for up to {MAX_MISSING_INDICATORS} selected Compustat features with training-window missingness >= {MISSING_INDICATOR_MIN_RATE:.0%}",
             "raw_level_policy": "prefer constructed ratios; keep transformed levels only for size proxies and per-share EPS",
             "target_leakage_guard": f"{TARGET_COLUMNS} are excluded from selection, winsorization, imputation, and scaling",
         },
@@ -748,7 +752,6 @@ def main() -> None:
         raise ValueError(f"Input panel is missing required columns: {sorted(missing_required)}")
 
     modeling_start = pd.Timestamp(args.modeling_start_date)
-    train_diag_end = pd.Timestamp(args.train_diagnostic_end_date)
 
     identifier_columns = present(columns, IDENTIFIER_COLUMNS)
     target_columns = present(columns, TARGET_COLUMNS)
@@ -761,23 +764,34 @@ def main() -> None:
     print(f"Reading panel keys: {args.input}", flush=True)
     keys = read_panel_keys(args.input)
     model_mask = keys["mthcaldt"].ge(modeling_start)
-    train_diag_mask = model_mask & keys["mthcaldt"].le(train_diag_end)
+    train_selection_mask = keys["mthcaldt"].between(
+        TRAIN_SELECTION_START,
+        TRAIN_SELECTION_END,
+        inclusive="both",
+    )
+    train_diag_mask = train_selection_mask
     print(f"Input rows: {len(keys):,}", flush=True)
     print("Duplicate PERMNO-MthCalDt rows in input: 0", flush=True)
-    print(f"Modeling-window rows for selection: {int(model_mask.sum()):,}", flush=True)
+    print(f"Training-window rows for selection: {int(train_selection_mask.sum()):,}", flush=True)
 
     print("Reading Compustat-like columns for diagnostics and engineering...", flush=True)
     compustat_data = pd.read_parquet(args.input, columns=compustat_columns)
     all_compustat_like = build_all_compustat_like_table(compustat_data, compustat_columns, model_mask)
+    df_train = compustat_data.loc[train_selection_mask]
+    if df_train.empty:
+        raise ValueError(
+            f"No rows found in the feature-selection training window "
+            f"{TRAIN_SELECTION_START.date()} to {TRAIN_SELECTION_END.date()}."
+        )
     raw_diagnostics, numeric_raw_columns = numeric_accounting_candidates(
-        compustat_data, compustat_columns, model_mask
+        compustat_data, compustat_columns, train_selection_mask
     )
     numeric = to_numeric_frame(compustat_data, numeric_raw_columns)
     engineered, ratio_status = build_engineered_compustat_features(numeric)
     engineered_diagnostics, selected_features = select_engineered_features(
         engineered,
         ratio_status,
-        model_mask,
+        train_selection_mask,
         train_diag_mask,
         args.missingness_threshold,
         args.near_zero_variance_threshold,

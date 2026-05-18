@@ -19,6 +19,7 @@ DEFAULT_DISTRIBUTION = Path(
 
 KEY_COLUMNS = ["permno", "mthcaldt"]
 TARGET_COLUMN = "target_ret_1m"
+TARGET_MONTH_COLUMN = "target_month"
 QUINTILE_COLUMN = "target_quintile"
 TOP_BOTTOM_COLUMN = "top_bottom_label"
 
@@ -49,6 +50,7 @@ def add_next_month_target(df: pd.DataFrame) -> pd.DataFrame:
     out["_month_period"] = out["mthcaldt"].dt.to_period("M")
     out["_next_month_period"] = out.groupby("permno", observed=True)["_month_period"].shift(-1)
     out[TARGET_COLUMN] = out.groupby("permno", observed=True)["mthret"].shift(-1)
+    out[TARGET_MONTH_COLUMN] = out["mthcaldt"] + pd.offsets.MonthEnd(1)
     consecutive = out["_next_month_period"].eq(out["_month_period"] + 1)
     out.loc[~consecutive, TARGET_COLUMN] = pd.NA
     return out
@@ -92,7 +94,7 @@ def output_columns(df: pd.DataFrame) -> list[str]:
         if col.startswith("comp_")
         or col in ["compustat_age_days", "compustat_match"]
     ]
-    target_cols = [TARGET_COLUMN, QUINTILE_COLUMN, TOP_BOTTOM_COLUMN]
+    target_cols = [TARGET_MONTH_COLUMN, TARGET_COLUMN, QUINTILE_COLUMN, TOP_BOTTOM_COLUMN]
     requested = identifier_cols + return_cols + comp_cols + target_cols
     return [col for col in requested if col in df.columns]
 

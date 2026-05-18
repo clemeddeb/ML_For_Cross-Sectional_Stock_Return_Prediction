@@ -25,6 +25,7 @@ DEFAULT_FEATURE_GROUPS = DEFAULT_TABLE_DIR / "feature_groups.json"
 DEFAULT_BATCH_SIZE = 100_000
 
 KEY_COLUMNS = ["permno", "mthcaldt"]
+TARGET_MONTH_COLUMN = "target_month"
 TARGET_COLUMN = "target_ret_1m"
 TARGET_LABEL_COLUMNS = ["target_quintile", "top_bottom_label"]
 
@@ -114,7 +115,7 @@ def parquet_columns(path: Path) -> list[str]:
 
 
 def assert_required_columns(columns: list[str]) -> None:
-    required = KEY_COLUMNS + [TARGET_COLUMN] + TARGET_LABEL_COLUMNS
+    required = KEY_COLUMNS + [TARGET_MONTH_COLUMN, TARGET_COLUMN] + TARGET_LABEL_COLUMNS
     missing = sorted(set(required).difference(columns))
     if missing:
         raise ValueError(f"Input panel is missing required columns: {missing}")
@@ -133,14 +134,20 @@ def assert_unique_permno_month(df: pd.DataFrame) -> None:
 def add_split(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["mthcaldt"] = pd.to_datetime(out["mthcaldt"], errors="coerce")
+    out[TARGET_MONTH_COLUMN] = pd.to_datetime(out[TARGET_MONTH_COLUMN], errors="coerce")
     invalid_dates = int(out["mthcaldt"].isna().sum())
     if invalid_dates:
         raise ValueError(f"Cannot create splits because {invalid_dates:,} rows have invalid dates.")
+    invalid_target_months = int(out[TARGET_MONTH_COLUMN].isna().sum())
+    if invalid_target_months:
+        raise ValueError(
+            f"Cannot create splits because {invalid_target_months:,} rows have invalid target months."
+        )
 
-    out = out.loc[out["mthcaldt"].ge(SAMPLE_START)].copy()
+    out = out.loc[out[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
     split = pd.Series(pd.NA, index=out.index, dtype="string")
     for split_name, (start, end) in SPLIT_WINDOWS.items():
-        mask = out["mthcaldt"].between(start, end, inclusive="both")
+        mask = out[TARGET_MONTH_COLUMN].between(start, end, inclusive="both")
         split.loc[mask] = split_name
     out["split"] = split
     out = out.loc[out["split"].notna()].copy()
@@ -165,11 +172,11 @@ def validate_splits(df: pd.DataFrame, feature_columns: list[str]) -> list[str]:
         raise ValueError("Every row must have one of train, validation, or test as split.")
     if df["split"].isna().any():
         raise ValueError("Every row must have a nonmissing split.")
-    if df["mthcaldt"].lt(SAMPLE_START).any():
-        raise ValueError("Rows before 1990 are included in the split output.")
+    if df[TARGET_MONTH_COLUMN].lt(SAMPLE_START).any():
+        raise ValueError("Rows with target_month before 1990 are included in the split output.")
 
     date_ranges = {
-        split: df.loc[df["split"].eq(split), "mthcaldt"] for split in SPLIT_ORDER
+        split: df.loc[df["split"].eq(split), TARGET_MONTH_COLUMN] for split in SPLIT_ORDER
     }
     empty_splits = [split for split, values in date_ranges.items() if values.empty]
     if empty_splits:
@@ -196,12 +203,12 @@ def build_split_summary(df: pd.DataFrame) -> pd.DataFrame:
         part = df.loc[df["split"].eq(split)]
         target = part[TARGET_COLUMN]
         quantiles = target.quantile([0.01, 0.05, 0.50, 0.95, 0.99])
-        unique_months = int(part["mthcaldt"].nunique())
+        unique_months = int(part[TARGET_MONTH_COLUMN].nunique())
         rows.append(
             {
                 "split": split,
-                "first_month": part["mthcaldt"].min().date().isoformat(),
-                "last_month": part["mthcaldt"].max().date().isoformat(),
+                "first_month": part[TARGET_MONTH_COLUMN].min().date().isoformat(),
+                "last_month": part[TARGET_MONTH_COLUMN].max().date().isoformat(),
                 "rows": int(len(part)),
                 "unique_permnos": int(part["permno"].nunique()),
                 "unique_months": unique_months,
@@ -249,14 +256,14 @@ def build_feature_coverage(
         feature: {split: 0 for split in SPLIT_ORDER} for feature in feature_columns
     }
     parquet = pq.ParquetFile(input_path)
-    columns = ["mthcaldt"] + feature_columns
+    columns = [TARGET_MONTH_COLUMN] + feature_columns
     for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
         part = batch.to_pandas()
-        part["mthcaldt"] = pd.to_datetime(part["mthcaldt"], errors="coerce")
-        part = part.loc[part["mthcaldt"].ge(SAMPLE_START)].copy()
+        part[TARGET_MONTH_COLUMN] = pd.to_datetime(part[TARGET_MONTH_COLUMN], errors="coerce")
+        part = part.loc[part[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
         if part.empty:
             continue
-        part["_split"] = split_values(part["mthcaldt"])
+        part["_split"] = split_values(part[TARGET_MONTH_COLUMN])
         part = part.loc[part["_split"].notna()]
         if part.empty:
             continue
@@ -300,12 +307,12 @@ def coverage_warnings(feature_coverage: pd.DataFrame) -> list[str]:
 
 def build_stocks_per_month(df: pd.DataFrame) -> pd.DataFrame:
     counts = (
-        df.groupby(["split", "mthcaldt"], observed=True)["permno"]
+        df.groupby(["split", TARGET_MONTH_COLUMN], observed=True)["permno"]
         .nunique()
         .rename("unique_permnos")
         .reset_index()
     )
-    counts["month"] = counts["mthcaldt"].dt.date.astype(str)
+    counts["month"] = counts[TARGET_MONTH_COLUMN].dt.date.astype(str)
     return counts[["split", "month", "unique_permnos"]]
 
 
@@ -359,7 +366,7 @@ def save_target_distribution_plot(df: pd.DataFrame, path: Path) -> None:
 
 def save_target_volatility_by_year_plot(df: pd.DataFrame, path: Path) -> None:
     annual = (
-        df.assign(year=df["mthcaldt"].dt.year)
+        df.assign(year=df[TARGET_MONTH_COLUMN].dt.year)
         .groupby(["split", "year"], observed=True)[TARGET_COLUMN]
         .std()
         .rename("target_ret_1m_std")
@@ -398,10 +405,11 @@ def write_split_panel(input_path: Path, output_path: Path, batch_size: int) -> i
         for batch in parquet.iter_batches(batch_size=batch_size):
             part = batch.to_pandas()
             part["mthcaldt"] = pd.to_datetime(part["mthcaldt"], errors="coerce")
-            part = part.loc[part["mthcaldt"].ge(SAMPLE_START)].copy()
+            part[TARGET_MONTH_COLUMN] = pd.to_datetime(part[TARGET_MONTH_COLUMN], errors="coerce")
+            part = part.loc[part[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
             if part.empty:
                 continue
-            part["split"] = split_values(part["mthcaldt"])
+            part["split"] = split_values(part[TARGET_MONTH_COLUMN])
             part = part.loc[part["split"].notna()].copy()
             if part.empty:
                 continue
@@ -445,6 +453,7 @@ def write_metadata(
     }
     metadata = {
         "sample_start_date": SAMPLE_START.date().isoformat(),
+        "split_date_column": TARGET_MONTH_COLUMN,
         "train_start": TRAIN_START.date().isoformat(),
         "train_end": TRAIN_END.date().isoformat(),
         "validation_start": VALIDATION_START.date().isoformat(),
@@ -476,7 +485,7 @@ def main() -> None:
 
     print("Loading key, target, and label columns for split diagnostics...", flush=True)
     diagnostics_input = pd.read_parquet(
-        args.input, columns=KEY_COLUMNS + [TARGET_COLUMN] + TARGET_LABEL_COLUMNS
+        args.input, columns=KEY_COLUMNS + [TARGET_MONTH_COLUMN, TARGET_COLUMN] + TARGET_LABEL_COLUMNS
     )
     assert_unique_permno_month(diagnostics_input)
 
