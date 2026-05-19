@@ -29,6 +29,7 @@ SPLITS = ["validation", "test"]
 FORBIDDEN_SCORE_COLUMNS = {"target_ret_1m", "target_quintile", "top_bottom_label"}
 MODEL_COLUMNS = {
     "gb_classifier": ("prediction_gb_classifier_score", "XGBoost classifier"),
+    "mlp_classifier": ("prediction_mlp_score", "MLP classifier"),
     "logistic_classifier": ("prediction_logistic_classifier_score", "Logistic classifier"),
     "naive_momentum": ("prediction_naive_momentum", "Naive momentum"),
     "gradient_boosting_reg": ("prediction_gradient_boosting_reg", "XGBoost regressor"),

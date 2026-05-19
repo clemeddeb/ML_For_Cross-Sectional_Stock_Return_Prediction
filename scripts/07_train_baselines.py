@@ -73,12 +73,16 @@ REGRESSION_PREDICTIONS = [
     "prediction_elastic_net",
     "prediction_gradient_boosting_reg",
     "prediction_logistic_classifier_score",
+    "prediction_mlp_score",
     "prediction_gb_classifier_score",
 ]
 CLASSIFIER_PROBABILITIES = [
     "prob_logistic_bottom",
     "prob_logistic_middle",
     "prob_logistic_top",
+    "prob_mlp_bottom",
+    "prob_mlp_middle",
+    "prob_mlp_top",
     "prob_gb_bottom",
     "prob_gb_middle",
     "prob_gb_top",
@@ -96,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Use a small deterministic sample.")
     parser.add_argument("--max-train-rows", type=int, default=None)
     parser.add_argument("--skip-boosting", action="store_true")
+    parser.add_argument("--skip-mlp", action="store_true", help="Skip the PyTorch MLP classifier baseline.")
     parser.add_argument("--only-boosting", action="store_true")
     parser.add_argument("--merge-boosting", action="store_true")
     parser.add_argument(
@@ -296,6 +301,17 @@ def import_xgboost() -> tuple[Any, Any]:
     return XGBRegressor, XGBClassifier
 
 
+def import_mlp_tools() -> tuple[Any, Any, Any]:
+    try:
+        from models.mlp_classifier import MLPTrainingConfig, predict_proba, train_mlp_classifier
+    except ImportError as exc:
+        raise ImportError(
+            "torch is required for the MLP classifier baseline. "
+            "Install project requirements or rerun with --skip-mlp."
+        ) from exc
+    return MLPTrainingConfig, predict_proba, train_mlp_classifier
+
+
 def fit_ridge_grid(x_train: np.ndarray, y_train: np.ndarray, val_df: pd.DataFrame, x_val: np.ndarray) -> tuple[Ridge, dict[str, Any], list[dict[str, Any]]]:
     rows = []
     best_model: Ridge | None = None
@@ -406,6 +422,34 @@ def fit_logistic_grid(
                 }
     assert best_model is not None
     return best_model, best_params, rows
+
+
+def train_mlp_classifier_baseline(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    validation_df: pd.DataFrame,
+    x_val: np.ndarray,
+    input_dim: int,
+    debug: bool,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]], Any]:
+    MLPTrainingConfig, predict_mlp_proba, train_mlp_classifier = import_mlp_tools()
+    config = MLPTrainingConfig(
+        input_dim=input_dim,
+        batch_size=1024 if debug else 4096,
+        max_epochs=3 if debug else 15,
+        patience=2 if debug else 3,
+        random_seed=RANDOM_SEED,
+    )
+    model, params, history = train_mlp_classifier(
+        x_train,
+        y_train,
+        x_val,
+        validation_df["mthcaldt"],
+        validation_df["target_ret_1m"],
+        config,
+    )
+    rows = history.to_dict(orient="records")
+    return model, params, rows, predict_mlp_proba
 
 
 def fit_gb_reg_grid(
@@ -1145,6 +1189,32 @@ def main() -> None:
     selected_params["logistic_classifier"] = logistic_params
     grid_rows.extend(rows)
 
+    mlp = None
+    predict_mlp_proba = None
+    if args.skip_mlp:
+        log("Skipping MLP classifier by request.")
+        warnings_out.append("MLP classifier skipped via --skip-mlp.")
+        skipped_columns.update(
+            {
+                "prediction_mlp_score",
+                "prob_mlp_bottom",
+                "prob_mlp_middle",
+                "prob_mlp_top",
+            }
+        )
+    else:
+        log("Training MLP classifier with train-only scaled features and validation Rank IC early stopping...")
+        mlp, mlp_params, rows, predict_mlp_proba = train_mlp_classifier_baseline(
+            x_train_linear,
+            y_train_clf,
+            validation_df,
+            x_val_linear,
+            len(feature_list),
+            args.debug,
+        )
+        selected_params["mlp_classifier"] = mlp_params
+        grid_rows.extend(rows)
+
     gb_reg = None
     gb_clf = None
     if args.skip_boosting:
@@ -1195,6 +1265,18 @@ def main() -> None:
     predictions["prob_logistic_top"] = logistic_probs[:, 2]
     predictions["prediction_logistic_classifier_score"] = logistic_probs[:, 2] - logistic_probs[:, 0]
 
+    if mlp is not None and predict_mlp_proba is not None:
+        mlp_probs = predict_mlp_proba(mlp, x_all_linear)
+        predictions["prob_mlp_bottom"] = mlp_probs[:, 0]
+        predictions["prob_mlp_middle"] = mlp_probs[:, 1]
+        predictions["prob_mlp_top"] = mlp_probs[:, 2]
+        predictions["prediction_mlp_score"] = mlp_probs[:, 2] - mlp_probs[:, 0]
+    else:
+        predictions["prob_mlp_bottom"] = np.nan
+        predictions["prob_mlp_middle"] = np.nan
+        predictions["prob_mlp_top"] = np.nan
+        predictions["prediction_mlp_score"] = np.nan
+
     if gb_reg is not None:
         predictions["prediction_gradient_boosting_reg"] = gb_reg.predict(panel[feature_list])
     else:
@@ -1232,6 +1314,7 @@ def main() -> None:
         "elastic_net": "prediction_elastic_net",
         "gradient_boosting_reg": "prediction_gradient_boosting_reg",
         "logistic_classifier": "prediction_logistic_classifier_score",
+        "mlp_classifier": "prediction_mlp_score",
         "gb_classifier": "prediction_gb_classifier_score",
     }
     classifier_columns = {
@@ -1239,6 +1322,11 @@ def main() -> None:
             "bottom": "prob_logistic_bottom",
             "middle": "prob_logistic_middle",
             "top": "prob_logistic_top",
+        },
+        "mlp_classifier": {
+            "bottom": "prob_mlp_bottom",
+            "middle": "prob_mlp_middle",
+            "top": "prob_mlp_top",
         },
         "gb_classifier": {
             "bottom": "prob_gb_bottom",
@@ -1268,6 +1356,12 @@ def main() -> None:
     joblib.dump(logistic, args.model_dir / "logistic_classifier_model.joblib")
     joblib.dump(linear_imputer, args.model_dir / "linear_median_imputer.joblib")
     joblib.dump(linear_scaler, args.model_dir / "linear_standard_scaler.joblib")
+    if mlp is not None:
+        try:
+            import torch
+        except ImportError as exc:
+            raise ImportError("torch is required to save the trained MLP classifier.") from exc
+        torch.save(mlp.state_dict(), args.model_dir / "mlp_classifier_state_dict.pt")
     if gb_reg is not None:
         joblib.dump(gb_reg, args.model_dir / "gradient_boosting_regressor.joblib")
     if gb_clf is not None:
