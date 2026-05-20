@@ -24,6 +24,11 @@ QUINTILE_COLUMN = "target_quintile"
 TOP_BOTTOM_COLUMN = "top_bottom_label"
 
 
+def next_calendar_month_end(dates: pd.Series) -> pd.Series:
+    month_period = pd.to_datetime(dates, errors="coerce").dt.to_period("M")
+    return month_period.add(1).dt.to_timestamp("M")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the monthly base modeling panel from linked CRSP/Compustat data."
@@ -50,7 +55,7 @@ def add_next_month_target(df: pd.DataFrame) -> pd.DataFrame:
     out["_month_period"] = out["mthcaldt"].dt.to_period("M")
     out["_next_month_period"] = out.groupby("permno", observed=True)["_month_period"].shift(-1)
     out[TARGET_COLUMN] = out.groupby("permno", observed=True)["mthret"].shift(-1)
-    out[TARGET_MONTH_COLUMN] = out["mthcaldt"] + pd.offsets.MonthEnd(1)
+    out[TARGET_MONTH_COLUMN] = next_calendar_month_end(out["mthcaldt"])
     consecutive = out["_next_month_period"].eq(out["_month_period"] + 1)
     out.loc[~consecutive, TARGET_COLUMN] = pd.NA
     return out

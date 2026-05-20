@@ -26,20 +26,54 @@ COST_BPS_LEVELS = [0, 5, 10, 25, 50, 100]
 LONG_SHORT_PORTFOLIOS = {"long_short_top_20": 0.20, "long_short_top_10": 0.10}
 LONG_ONLY_PORTFOLIOS = {"long_only_top_20": 0.20, "long_only_top_10": 0.10}
 SPLITS = ["validation", "test"]
+VALIDATION_START = pd.Timestamp("2011-01-01")
+VALIDATION_END = pd.Timestamp("2015-12-31")
+TEST_START = pd.Timestamp("2016-01-01")
+TEST_END = pd.Timestamp("2024-11-30")
 FORBIDDEN_SCORE_COLUMNS = {"target_ret_1m", "target_quintile", "top_bottom_label"}
 MODEL_COLUMNS = {
     "gb_classifier": ("prediction_gb_classifier_score", "XGBoost classifier"),
     "logistic_classifier": ("prediction_logistic_classifier_score", "Logistic classifier"),
     "naive_momentum": ("prediction_naive_momentum", "Naive momentum"),
+    "naive_reversal": ("prediction_naive_reversal", "Naive reversal"),
+    "ridge": ("prediction_ridge", "Ridge"),
+    "elastic_net": ("prediction_elastic_net", "Elastic Net"),
     "gradient_boosting_reg": ("prediction_gradient_boosting_reg", "XGBoost regressor"),
 }
+MODEL_ORDER = [
+    "naive_momentum",
+    "naive_reversal",
+    "ridge",
+    "elastic_net",
+    "logistic_classifier",
+    "gradient_boosting_reg",
+    "gb_classifier",
+]
 OUTPUT_FILES = {
     "monthly_returns": DEFAULT_OUTPUT_DIR / "backtest_monthly_returns.csv",
     "performance_summary": DEFAULT_OUTPUT_DIR / "backtest_performance_summary.csv",
     "break_even": DEFAULT_OUTPUT_DIR / "backtest_break_even_costs.csv",
+    "equal_weight_monthly": DEFAULT_OUTPUT_DIR / "equal_weight_portfolio_monthly_returns.csv",
+    "equal_weight_summary": DEFAULT_OUTPUT_DIR / "equal_weight_portfolio_summary.csv",
     "spy_returns": DEFAULT_OUTPUT_DIR / "spy_benchmark_returns.csv",
     "readme": DEFAULT_OUTPUT_DIR / "backtest_readme.md",
 }
+
+
+def month_period(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce").dt.to_period("M")
+
+
+def month_end_timestamp(periods: pd.Series) -> pd.Series:
+    return periods.dt.to_timestamp("M")
+
+
+def assign_backtest_split(return_periods: pd.Series) -> pd.Series:
+    dates = month_end_timestamp(return_periods)
+    split = pd.Series(pd.NA, index=dates.index, dtype="string")
+    split.loc[dates.between(VALIDATION_START, VALIDATION_END, inclusive="both")] = "validation"
+    split.loc[dates.between(TEST_START, TEST_END, inclusive="both")] = "test"
+    return split
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--figure-dir", type=Path, default=DEFAULT_FIGURE_DIR)
+    parser.add_argument("--portfolio-count", type=int, default=5)
     return parser.parse_args()
 
 
@@ -96,34 +131,34 @@ def available_models(columns: list[str]) -> dict[str, tuple[str, str]]:
 
 def load_predictions(path: Path) -> tuple[pd.DataFrame, dict[str, tuple[str, str]]]:
     df = pd.read_parquet(path)
-    if "split" not in df.columns:
-        raise ValueError("Prediction file must contain a split column.")
     if df.duplicated(["PERMNO", "MthCalDt"]).any():
         raise ValueError("Prediction file contains duplicate PERMNO-month rows.")
     models = available_models(df.columns.tolist())
-    selected_columns = ["PERMNO", "MthCalDt", "split", "target_ret_1m"] + [
+    selected_columns = ["PERMNO", "MthCalDt", "target_ret_1m"] + [
         column for column, _ in models.values()
     ]
     df = df[selected_columns].copy()
     df["MthCalDt"] = pd.to_datetime(df["MthCalDt"], errors="raise")
-    df["split"] = df["split"].astype("string")
     df["target_ret_1m"] = pd.to_numeric(df["target_ret_1m"], errors="coerce")
-    if df.loc[df["split"].isin(SPLITS), "target_ret_1m"].isna().any():
-        raise ValueError("target_ret_1m is missing for rows used in validation/test backtests.")
     for column, _ in models.values():
         if column in FORBIDDEN_SCORE_COLUMNS:
             raise ValueError(f"Forbidden score column selected: {column}")
         df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["formation_period"] = month_period(df["MthCalDt"])
+    df["return_period"] = df["formation_period"] + 1
+    df["return_month"] = month_end_timestamp(df["return_period"])
+    df["split"] = assign_backtest_split(df["return_period"])
+    df = df.loc[df["split"].isin(SPLITS)].copy()
+    if df["target_ret_1m"].isna().any():
+        raise ValueError("target_ret_1m is missing for rows used in validation/test backtests.")
     date_ranges = {
-        split: df.loc[df["split"].eq(split), "MthCalDt"].sort_values()
+        split: df.loc[df["split"].eq(split), "return_period"].sort_values()
         for split in SPLITS
     }
     if any(values.empty for values in date_ranges.values()):
         raise ValueError("Validation/test rows are required for backtesting.")
     if not date_ranges["validation"].max() < date_ranges["test"].min():
         raise ValueError("Validation period must be strictly before test period.")
-    df = df.loc[df["split"].isin(SPLITS)].copy()
-    df["return_month"] = df["MthCalDt"] + pd.offsets.MonthEnd(1)
     return df, models
 
 
@@ -166,14 +201,42 @@ def backtest_model(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for split in SPLITS:
-        split_df = df.loc[df["split"].eq(split), ["PERMNO", "MthCalDt", "return_month", "target_ret_1m", score_column]].dropna()
+        split_df = df.loc[
+            df["split"].eq(split),
+            [
+                "PERMNO",
+                "MthCalDt",
+                "formation_period",
+                "return_period",
+                "return_month",
+                "target_ret_1m",
+                score_column,
+            ],
+        ].dropna()
         if split_df.empty:
             continue
         for portfolio_type, fraction in {**LONG_ONLY_PORTFOLIOS, **LONG_SHORT_PORTFOLIOS}.items():
             previous_target_weights: dict[int, float] = {}
             previous_realized_returns: dict[int, float] = {}
-            for month, part in split_df.groupby("MthCalDt", sort=True, observed=True):
-                target_return_month = pd.Timestamp(month) + pd.offsets.MonthEnd(1)
+            for formation_period, part in split_df.groupby("formation_period", sort=True, observed=True):
+                unique_formation_months = part["MthCalDt"].drop_duplicates()
+                if len(unique_formation_months) != 1:
+                    raise ValueError(
+                        f"Expected exactly one MthCalDt for formation period {formation_period}."
+                    )
+                formation_month = pd.Timestamp(unique_formation_months.iloc[0])
+                unique_return_periods = part["return_period"].drop_duplicates()
+                if len(unique_return_periods) != 1:
+                    raise ValueError(
+                        f"Expected exactly one return_period for formation period {formation_period}."
+                    )
+                target_return_period = unique_return_periods.iloc[0]
+                unique_return_months = part["return_month"].drop_duplicates()
+                if len(unique_return_months) != 1:
+                    raise ValueError(
+                        f"Expected exactly one return_month for formation period {formation_period}."
+                    )
+                target_return_month = pd.Timestamp(unique_return_months.iloc[0])
                 longs = select_extreme_bucket(part, score_column, fraction, ascending=False)
                 longs = longs.assign(weight=1.0 / len(longs))
                 if portfolio_type.startswith("long_only"):
@@ -208,7 +271,9 @@ def backtest_model(
                         "model_label": model_label,
                         "split": split,
                         "portfolio_type": portfolio_type,
-                        "formation_month": pd.Timestamp(month).date().isoformat(),
+                        "formation_period": formation_period,
+                        "formation_month": formation_month.date().isoformat(),
+                        "return_period": target_return_period,
                         "return_month": pd.Timestamp(target_return_month).date().isoformat(),
                         "score_column": score_column,
                         "gross_return": gross_return,
@@ -223,11 +288,209 @@ def backtest_model(
     return pd.DataFrame(rows)
 
 
-def fetch_spy_monthly_returns(months: pd.Series) -> pd.DataFrame:
+def assign_portfolios(scores: pd.Series, portfolio_count: int) -> pd.Series:
+    valid = scores.notna()
+    out = pd.Series(pd.NA, index=scores.index, dtype="Int64")
+    if int(valid.sum()) < portfolio_count:
+        return out
+    ranked = scores.loc[valid].rank(method="first")
+    buckets = pd.qcut(ranked, q=portfolio_count, labels=False, duplicates="drop")
+    if buckets.nunique(dropna=True) != portfolio_count:
+        return out
+    out.loc[valid] = buckets.astype("int64") + 1
+    return out
+
+
+def build_equal_weight_backtest(
+    predictions: pd.DataFrame,
+    models: dict[str, tuple[str, str]],
+    portfolio_count: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for model in MODEL_ORDER:
+        if model not in models:
+            continue
+        score_column, model_label = models[model]
+        data = predictions[
+            [
+                "MthCalDt",
+                "formation_period",
+                "return_period",
+                "return_month",
+                "split",
+                "target_ret_1m",
+                score_column,
+            ]
+        ].dropna(subset=["MthCalDt", "formation_period", "return_period", "return_month", "split", "target_ret_1m"])
+        if data.empty:
+            continue
+        for (split, formation_period), part in data.groupby(["split", "formation_period"], sort=True, observed=True):
+            unique_formation_months = part["MthCalDt"].drop_duplicates()
+            if len(unique_formation_months) != 1:
+                raise ValueError(
+                    f"Expected exactly one MthCalDt for equal-weight formation period {formation_period}."
+                )
+            formation_month = pd.Timestamp(unique_formation_months.iloc[0])
+            unique_return_periods = part["return_period"].drop_duplicates()
+            if len(unique_return_periods) != 1:
+                raise ValueError(
+                    f"Expected exactly one return_period for equal-weight formation period {formation_period}."
+                )
+            return_period = unique_return_periods.iloc[0]
+            unique_return_months = part["return_month"].drop_duplicates()
+            if len(unique_return_months) != 1:
+                raise ValueError(
+                    f"Expected exactly one return_month for equal-weight formation period {formation_period}."
+                )
+            return_month = pd.Timestamp(unique_return_months.iloc[0])
+            bucket = assign_portfolios(part[score_column], portfolio_count)
+            if bucket.isna().all():
+                continue
+            bucketed = part.assign(portfolio=bucket).dropna(subset=["portfolio"])
+            grouped = (
+                bucketed.groupby("portfolio", observed=True)["target_ret_1m"]
+                .agg(equal_weight_return="mean", n_stocks="size")
+                .reset_index()
+            )
+            if grouped.empty:
+                continue
+            grouped["portfolio"] = grouped["portfolio"].astype(int)
+            return_map = grouped.set_index("portfolio")["equal_weight_return"]
+            count_map = grouped.set_index("portfolio")["n_stocks"]
+            for row in grouped.to_dict(orient="records"):
+                rows.append(
+                    {
+                        "model": model,
+                        "model_label": model_label,
+                        "split": str(split),
+                        "formation_period": formation_period,
+                        "formation_month": formation_month.date().isoformat(),
+                        "return_period": return_period,
+                        "return_month": return_month.date().isoformat(),
+                        "portfolio": f"Q{int(row['portfolio'])}",
+                        "portfolio_index": int(row["portfolio"]),
+                        "n_stocks": int(row["n_stocks"]),
+                        "equal_weight_return": float(row["equal_weight_return"]),
+                    }
+                )
+            if 1 in return_map.index and portfolio_count in return_map.index:
+                rows.append(
+                    {
+                        "model": model,
+                        "model_label": model_label,
+                        "split": str(split),
+                        "formation_period": formation_period,
+                        "formation_month": formation_month.date().isoformat(),
+                        "return_period": return_period,
+                        "return_month": return_month.date().isoformat(),
+                        "portfolio": f"Q{portfolio_count}-Q1",
+                        "portfolio_index": portfolio_count + 1,
+                        "n_stocks": int(count_map.loc[1] + count_map.loc[portfolio_count]),
+                        "equal_weight_return": float(return_map.loc[portfolio_count] - return_map.loc[1]),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def summarize_equal_weight_backtest(monthly_returns: pd.DataFrame) -> pd.DataFrame:
+    if monthly_returns.empty:
+        return monthly_returns
+    rows = []
+    for keys, part in monthly_returns.groupby(
+        ["model", "model_label", "split", "portfolio", "portfolio_index"],
+        sort=True,
+        observed=True,
+    ):
+        returns = part["equal_weight_return"].astype("float64")
+        rows.append(
+            {
+                "model": keys[0],
+                "model_label": keys[1],
+                "split": keys[2],
+                "portfolio": keys[3],
+                "portfolio_index": int(keys[4]),
+                "months": int(len(part)),
+                "average_number_of_stocks": float(part["n_stocks"].mean()),
+                "median_number_of_stocks": float(part["n_stocks"].median()),
+                "cumulative_return": cumulative_return(returns),
+                "annualized_return": annualized_return(returns),
+                "annualized_volatility": annualized_volatility(returns),
+                "sharpe_ratio": sharpe_ratio(returns),
+                "sortino_ratio": sortino_ratio(returns),
+                "max_drawdown": max_drawdown(returns),
+                "mean_monthly_return": float(returns.mean()),
+                "monthly_return_tstat": monthly_return_tstat(returns),
+                "hit_rate": float((returns > 0).mean()),
+            }
+        )
+    out = pd.DataFrame(rows)
+    return out.sort_values(["split", "portfolio_index", "model_label"]).reset_index(drop=True)
+
+
+def assert_strategy_return_period_uniqueness(monthly_returns: pd.DataFrame) -> None:
+    key_columns = ["model", "split", "portfolio_type", "cost_bps", "return_period"]
+    duplicates = monthly_returns.duplicated(key_columns, keep=False)
+    if duplicates.any():
+        sample = monthly_returns.loc[duplicates, key_columns].head(20)
+        raise ValueError(
+            "Duplicate strategy backtest rows found for model/split/portfolio_type/cost_bps/return_period. "
+            f"First duplicates:\n{sample.to_string(index=False)}"
+        )
+    counts = (
+        monthly_returns.groupby(["model", "split", "portfolio_type", "cost_bps"], observed=True)["return_period"]
+        .agg(rows="size", unique_return_periods="nunique")
+        .reset_index()
+    )
+    invalid = counts.loc[counts["rows"] != counts["unique_return_periods"]]
+    if not invalid.empty:
+        raise ValueError(
+            "Each strategy backtest group must have exactly one row per return_period. "
+            f"First invalid groups:\n{invalid.head(20).to_string(index=False)}"
+        )
+
+
+def assert_equal_weight_return_period_uniqueness(monthly_returns: pd.DataFrame) -> None:
+    if monthly_returns.empty:
+        return
+    key_columns = ["model", "split", "portfolio", "return_period"]
+    duplicates = monthly_returns.duplicated(key_columns, keep=False)
+    if duplicates.any():
+        sample = monthly_returns.loc[duplicates, key_columns].head(20)
+        raise ValueError(
+            "Duplicate equal-weight backtest rows found for model/split/portfolio/return_period. "
+            f"First duplicates:\n{sample.to_string(index=False)}"
+        )
+    counts = (
+        monthly_returns.groupby(["model", "split", "portfolio"], observed=True)["return_period"]
+        .agg(rows="size", unique_return_periods="nunique")
+        .reset_index()
+    )
+    invalid = counts.loc[counts["rows"] != counts["unique_return_periods"]]
+    if not invalid.empty:
+        raise ValueError(
+            "Each equal-weight backtest group must have exactly one row per return_period. "
+            f"First invalid groups:\n{invalid.head(20).to_string(index=False)}"
+        )
+
+
+def finalize_output_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if "formation_period" in out.columns:
+        out["formation_period"] = out["formation_period"].astype(str)
+    if "return_period" in out.columns:
+        out["return_period"] = out["return_period"].astype(str)
+    if "formation_month" in out.columns:
+        out["formation_month"] = pd.to_datetime(out["formation_month"], errors="raise").dt.date.astype(str)
+    if "return_month" in out.columns:
+        out["return_month"] = pd.to_datetime(out["return_month"], errors="raise").dt.date.astype(str)
+    return out
+
+
+def fetch_spy_monthly_returns(return_periods: pd.Series) -> pd.DataFrame:
     yf = import_yfinance()
-    month_index = pd.to_datetime(months, errors="raise").sort_values().drop_duplicates()
-    start = (month_index.min() - pd.offsets.MonthEnd(2)).date().isoformat()
-    end = (month_index.max() + pd.offsets.MonthEnd(1) + pd.Timedelta(days=5)).date().isoformat()
+    month_index = pd.PeriodIndex(return_periods.astype("period[M]").drop_duplicates().sort_values(), freq="M")
+    start = (month_index.min() - 2).to_timestamp("M").date().isoformat()
+    end = ((month_index.max() + 1).to_timestamp("M") + pd.Timedelta(days=5)).date().isoformat()
     benchmark = yf.download(
         BENCHMARK_TICKER,
         start=start,
@@ -254,12 +517,21 @@ def fetch_spy_monthly_returns(months: pd.Series) -> pd.DataFrame:
     monthly = adj_close.resample("ME").last().pct_change().dropna().rename("spy_return").to_frame()
     monthly = monthly.reset_index().rename(columns={"Date": "return_month"})
     monthly["return_month"] = pd.to_datetime(monthly["return_month"], errors="raise")
-    benchmark_months = pd.DataFrame({"return_month": month_index})
-    aligned = benchmark_months.merge(monthly, on="return_month", how="left", validate="one_to_one")
+    monthly["return_period"] = monthly["return_month"].dt.to_period("M")
+    benchmark_months = pd.DataFrame({"return_period": month_index})
+    aligned = benchmark_months.merge(
+        monthly[["return_period", "spy_return"]],
+        on="return_period",
+        how="left",
+        validate="one_to_one",
+    )
+    aligned["return_month"] = aligned["return_period"].dt.to_timestamp("M")
     if aligned["spy_return"].isna().any():
-        missing = aligned.loc[aligned["spy_return"].isna(), "return_month"].dt.date.tolist()
+        missing = aligned.loc[aligned["spy_return"].isna(), "return_period"].astype(str).tolist()
         raise RuntimeError(f"Missing SPY benchmark returns for months: {missing[:5]}")
-    return aligned.sort_values("return_month").reset_index(drop=True)
+    if aligned.duplicated(["return_period"]).any():
+        raise RuntimeError("SPY benchmark alignment produced duplicate return_period rows.")
+    return aligned.sort_values("return_period").reset_index(drop=True)
 
 
 def expand_costs(monthly_returns: pd.DataFrame, spy_returns: pd.DataFrame) -> pd.DataFrame:
@@ -273,13 +545,19 @@ def expand_costs(monthly_returns: pd.DataFrame, spy_returns: pd.DataFrame) -> pd
         frame["cost_rate"] = cost_rate
         frame["net_return"] = frame["gross_return"] - cost_rate * frame["turnover"]
         frame["return_month"] = pd.to_datetime(frame["return_month"], errors="raise")
-        frame = frame.merge(spy, on="return_month", how="left", validate="many_to_one")
+        frame = frame.merge(
+            spy[["return_period", "return_month", "spy_return"]],
+            on="return_period",
+            how="left",
+            validate="many_to_one",
+            suffixes=("", "_spy"),
+        )
+        frame["return_month"] = pd.to_datetime(frame["return_month_spy"], errors="raise")
+        frame = frame.drop(columns=["return_month_spy"])
         if frame["spy_return"].isna().any():
             raise ValueError("SPY benchmark alignment produced missing values.")
         expanded_frames.append(frame)
     out = pd.concat(expanded_frames, ignore_index=True)
-    out["formation_month"] = pd.to_datetime(out["formation_month"], errors="raise").dt.date.astype(str)
-    out["return_month"] = pd.to_datetime(out["return_month"], errors="raise").dt.date.astype(str)
     return out
 
 
@@ -493,14 +771,13 @@ def build_break_even_table(monthly_returns: pd.DataFrame) -> pd.DataFrame:
 
 def attach_split_to_benchmark(monthly_returns: pd.DataFrame) -> pd.DataFrame:
     spy = (
-        monthly_returns[["split", "return_month", "spy_return"]]
+        monthly_returns[["split", "return_period", "return_month", "spy_return"]]
         .drop_duplicates()
-        .sort_values(["split", "return_month"])
+        .sort_values(["split", "return_period"])
         .reset_index(drop=True)
     )
     spy["return_month"] = pd.to_datetime(spy["return_month"], errors="raise")
     spy["cumulative_wealth"] = spy.groupby("split", observed=True)["spy_return"].transform(lambda s: (1.0 + s).cumprod())
-    spy["return_month"] = spy["return_month"].dt.date.astype(str)
     return spy
 
 
@@ -533,6 +810,35 @@ def plot_cumulative_wealth(
     spy_wealth = (1.0 + spy["spy_return"]).cumprod()
     ax.plot(spy["return_month"], spy_wealth, linewidth=1.8, color="black", linestyle="--", label=BENCHMARK_TICKER)
     ax.set_title(title)
+    ax.set_xlabel("Return month")
+    ax.set_ylabel("Cumulative wealth")
+    ax.legend(frameon=False, fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def plot_equal_weight_long_short_cumulative(
+    monthly_returns: pd.DataFrame,
+    split: str,
+    portfolio_count: int,
+    path: Path,
+) -> None:
+    label = f"Q{portfolio_count}-Q1"
+    data = monthly_returns.loc[
+        monthly_returns["split"].eq(split) & monthly_returns["portfolio"].eq(label)
+    ].copy()
+    if data.empty:
+        return
+    data["return_month"] = pd.to_datetime(data["return_month"], errors="raise")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for model in MODEL_ORDER:
+        part = data.loc[data["model"].eq(model)].sort_values("return_month")
+        if part.empty:
+            continue
+        wealth = (1.0 + part["equal_weight_return"]).cumprod()
+        ax.plot(part["return_month"], wealth, linewidth=1.5, label=part["model_label"].iloc[0])
+    ax.set_title(f"{split.title()} equal-weight {label} cumulative wealth")
     ax.set_xlabel("Return month")
     ax.set_ylabel("Cumulative wealth")
     ax.legend(frameon=False, fontsize=8, ncol=2)
@@ -632,8 +938,13 @@ def write_readme(
     prediction_path: Path,
     models: dict[str, tuple[str, str]],
     monthly_returns: pd.DataFrame,
+    equal_weight_monthly: pd.DataFrame,
+    portfolio_count: int,
 ) -> None:
     test_rows = monthly_returns.loc[monthly_returns["split"].eq("test")]
+    test_return_periods = monthly_returns.loc[
+        monthly_returns["split"].eq("test"), "return_period"
+    ].nunique()
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# Baseline Backtests\n\n")
         handle.write(f"- Prediction source: `{prediction_path}`\n")
@@ -641,9 +952,14 @@ def write_readme(
         handle.write("- Split coverage: validation and test only\n")
         handle.write("- Formation rule: portfolios use prediction scores at month t and earn `target_ret_1m`\n")
         handle.write("- Portfolio construction: equal-weight top 20% long-only and top/bottom 20% long-short; top/bottom 10% variants also included\n")
+        handle.write(f"- Equal-weight quintile backtest: {portfolio_count} score-sorted portfolios plus `Q{portfolio_count}-Q1`\n")
         handle.write("- Transaction cost model: `net_return = gross_return - cost_rate * turnover`\n")
         handle.write("- Turnover definition: total traded notional from changes in signed portfolio weights, including initial entry\n")
         handle.write(f"- Test monthly observations: {len(test_rows):,}\n")
+        handle.write(f"- Unique test return months: {test_return_periods:,}\n")
+        handle.write(
+            f"- Equal-weight test observations: {len(equal_weight_monthly.loc[equal_weight_monthly['split'].eq('test')]):,}\n"
+        )
         handle.write("\n## Outputs\n\n")
         for name, output_path in OUTPUT_FILES.items():
             handle.write(f"- `{name}`: `{output_path}`\n")
@@ -682,23 +998,58 @@ def main() -> None:
     gross_monthly = pd.concat(monthly_frames, ignore_index=True)
     if gross_monthly.empty:
         raise ValueError("No monthly strategy returns were generated.")
+    base_strategy_rows = gross_monthly.copy()
+    base_strategy_rows["cost_bps"] = 0
+    assert_strategy_return_period_uniqueness(base_strategy_rows)
 
     log("Fetching SPY benchmark from yfinance...")
-    spy_returns = fetch_spy_monthly_returns(pd.to_datetime(gross_monthly["return_month"], errors="raise"))
+    spy_returns = fetch_spy_monthly_returns(gross_monthly["return_period"])
 
     log("Applying trading cost scenarios...")
     monthly_returns = expand_costs(gross_monthly, spy_returns)
+    assert_strategy_return_period_uniqueness(monthly_returns)
     performance_summary = summarize_backtests(monthly_returns)
     break_even = build_break_even_table(monthly_returns)
     spy_monthly = attach_split_to_benchmark(monthly_returns)
     spy_summary = summarize_spy_benchmark(spy_monthly)
 
+    log("Building equal-weight quintile backtests...")
+    equal_weight_monthly = build_equal_weight_backtest(predictions, models, args.portfolio_count)
+    assert_equal_weight_return_period_uniqueness(equal_weight_monthly)
+    equal_weight_summary = summarize_equal_weight_backtest(equal_weight_monthly)
+
+    test_return_periods = (
+        monthly_returns.loc[monthly_returns["split"].eq("test"), "return_period"]
+        .drop_duplicates()
+        .sort_values()
+    )
+    if test_return_periods.empty:
+        raise ValueError("No test return_periods were generated.")
+    log(
+        "Test return months: "
+        f"{len(test_return_periods)} "
+        f"({test_return_periods.iloc[0]} to {test_return_periods.iloc[-1]})"
+    )
+
+    monthly_returns_out = finalize_output_frame(monthly_returns)
+    equal_weight_monthly_out = finalize_output_frame(equal_weight_monthly)
+    spy_monthly_out = finalize_output_frame(spy_monthly)
+
     log("Writing backtest outputs...")
-    monthly_returns.to_csv(output_dir / OUTPUT_FILES["monthly_returns"].name, index=False)
+    monthly_returns_out.to_csv(output_dir / OUTPUT_FILES["monthly_returns"].name, index=False)
     performance_summary.to_csv(output_dir / OUTPUT_FILES["performance_summary"].name, index=False)
     break_even.to_csv(output_dir / OUTPUT_FILES["break_even"].name, index=False)
-    spy_monthly.to_csv(output_dir / OUTPUT_FILES["spy_returns"].name, index=False)
-    write_readme(output_dir / OUTPUT_FILES["readme"].name, prediction_path, models, monthly_returns)
+    equal_weight_monthly_out.to_csv(output_dir / OUTPUT_FILES["equal_weight_monthly"].name, index=False)
+    equal_weight_summary.to_csv(output_dir / OUTPUT_FILES["equal_weight_summary"].name, index=False)
+    spy_monthly_out.to_csv(output_dir / OUTPUT_FILES["spy_returns"].name, index=False)
+    write_readme(
+        output_dir / OUTPUT_FILES["readme"].name,
+        prediction_path,
+        models,
+        monthly_returns,
+        equal_weight_monthly,
+        args.portfolio_count,
+    )
 
     log("Writing figures...")
     plot_cumulative_wealth(
@@ -732,6 +1083,18 @@ def main() -> None:
         50,
         figure_dir / "test_cumulative_wealth_50bps_costs.png",
         "Test cumulative wealth: long-short top 20% with 50 bps one-way cost vs SPY",
+    )
+    plot_equal_weight_long_short_cumulative(
+        equal_weight_monthly,
+        "validation",
+        args.portfolio_count,
+        figure_dir / "validation_equal_weight_long_short_cumulative_wealth.png",
+    )
+    plot_equal_weight_long_short_cumulative(
+        equal_weight_monthly,
+        "test",
+        args.portfolio_count,
+        figure_dir / "test_equal_weight_long_short_cumulative_wealth.png",
     )
     plot_drawdowns(monthly_returns, figure_dir / "test_drawdowns_main_strategies.png")
     plot_sharpe_bars(performance_summary, figure_dir / "test_sharpe_ratio_bar_chart.png")
@@ -812,6 +1175,8 @@ def main() -> None:
         output_dir / OUTPUT_FILES["monthly_returns"].name,
         output_dir / OUTPUT_FILES["performance_summary"].name,
         output_dir / OUTPUT_FILES["break_even"].name,
+        output_dir / OUTPUT_FILES["equal_weight_monthly"].name,
+        output_dir / OUTPUT_FILES["equal_weight_summary"].name,
         output_dir / OUTPUT_FILES["spy_returns"].name,
         output_dir / OUTPUT_FILES["readme"].name,
         figure_dir,

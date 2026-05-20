@@ -238,11 +238,23 @@ python scripts/07_train_baselines.py --merge-boosting
 ```
 
 After baseline and boosting predictions have been merged, refresh the
-comparison figures without retraining:
+diagnostic comparison figures without retraining:
 
 ```bash
 python scripts/08_plot_baseline_comparison.py
 ```
+
+Run the consolidated backtest script with:
+
+```bash
+python scripts/09_backtest_baselines.py
+```
+
+Script `08_plot_baseline_comparison.py` now writes only model-diagnostic
+tables and figures. Script `09_backtest_baselines.py` is the single backtest
+entry point: it writes the SPY-relative long-only/long-short backtests, the
+equal-weight quintile portfolio backtests, benchmark summaries, and backtest
+figures under `outputs/backtests/`.
 
 The baseline script reads
 `Dataset/Processed/model_panel_full_features_with_splits.parquet`, uses only

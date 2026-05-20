@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh baseline comparison figures and portfolio backtests."""
+"""Refresh baseline comparison and diagnostic figures."""
 
 from __future__ import annotations
 
@@ -61,15 +61,6 @@ CLASS_LABELS = {
     2: "Top",
 }
 
-PORTFOLIO_NAMES = {
-    1: "Q1",
-    2: "Q2",
-    3: "Q3",
-    4: "Q4",
-    5: "Q5",
-}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refresh baseline comparison figures.")
     parser.add_argument("--baseline-monthly-ic", type=Path, default=DEFAULT_BASELINE_MONTHLY_IC)
@@ -80,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-dir", type=Path, default=DEFAULT_TABLE_DIR)
     parser.add_argument("--figure-dir", type=Path, default=DEFAULT_FIGURE_DIR)
     parser.add_argument("--distribution-sample-rows", type=int, default=200_000)
-    parser.add_argument("--portfolio-count", type=int, default=5)
     return parser.parse_args()
 
 
@@ -263,157 +253,6 @@ def plot_confusion(confusion: pd.DataFrame, split: str, path: Path) -> None:
     plt.close(fig)
 
 
-def read_predictions(path: Path) -> pd.DataFrame:
-    columns = ["MthCalDt", "split", "target_ret_1m"] + list(PREDICTION_COLUMNS.values())
-    if not path.exists():
-        raise FileNotFoundError(path)
-    predictions = pd.read_parquet(path, columns=columns)
-    predictions["MthCalDt"] = pd.to_datetime(predictions["MthCalDt"], errors="raise")
-    predictions["target_ret_1m"] = pd.to_numeric(predictions["target_ret_1m"], errors="coerce")
-    predictions["split"] = predictions["split"].astype("string")
-    for column in PREDICTION_COLUMNS.values():
-        if column in predictions.columns:
-            predictions[column] = pd.to_numeric(predictions[column], errors="coerce")
-    return predictions
-
-
-def assign_portfolios(scores: pd.Series, portfolio_count: int) -> pd.Series:
-    valid = scores.notna()
-    out = pd.Series(pd.NA, index=scores.index, dtype="Int64")
-    if int(valid.sum()) < portfolio_count:
-        return out
-    ranked = scores.loc[valid].rank(method="first")
-    buckets = pd.qcut(ranked, q=portfolio_count, labels=False, duplicates="drop")
-    if buckets.nunique(dropna=True) != portfolio_count:
-        return out
-    out.loc[valid] = buckets.astype("int64") + 1
-    return out
-
-
-def build_portfolio_backtest(predictions: pd.DataFrame, portfolio_count: int) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for model in MODEL_ORDER:
-        column = PREDICTION_COLUMNS[model]
-        if column not in predictions.columns:
-            continue
-        data = predictions[["MthCalDt", "split", "target_ret_1m", column]].dropna(
-            subset=["MthCalDt", "split", "target_ret_1m"]
-        )
-        if data.empty:
-            continue
-        for (split, month), part in data.groupby(["split", "MthCalDt"], sort=True, observed=True):
-            bucket = assign_portfolios(part[column], portfolio_count)
-            if bucket.isna().all():
-                continue
-            part = part.assign(portfolio=bucket).dropna(subset=["portfolio"])
-            grouped = (
-                part.groupby("portfolio", observed=True)["target_ret_1m"]
-                .agg(equal_weight_return="mean", n_stocks="size")
-                .reset_index()
-            )
-            if grouped.empty:
-                continue
-            grouped["portfolio"] = grouped["portfolio"].astype(int)
-            return_map = grouped.set_index("portfolio")["equal_weight_return"]
-            count_map = grouped.set_index("portfolio")["n_stocks"]
-            for row in grouped.to_dict(orient="records"):
-                rows.append(
-                    {
-                        "model": model,
-                        "model_label": MODEL_LABELS.get(model, model),
-                        "split": str(split),
-                        "month": month.date().isoformat(),
-                        "portfolio": PORTFOLIO_NAMES[int(row["portfolio"])],
-                        "portfolio_index": int(row["portfolio"]),
-                        "n_stocks": int(row["n_stocks"]),
-                        "equal_weight_return": float(row["equal_weight_return"]),
-                    }
-                )
-            if 1 in return_map.index and portfolio_count in return_map.index:
-                rows.append(
-                    {
-                        "model": model,
-                        "model_label": MODEL_LABELS.get(model, model),
-                        "split": str(split),
-                        "month": month.date().isoformat(),
-                        "portfolio": f"Q{portfolio_count}-Q1",
-                        "portfolio_index": portfolio_count + 1,
-                        "n_stocks": int(count_map.loc[1] + count_map.loc[portfolio_count]),
-                        "equal_weight_return": float(return_map.loc[portfolio_count] - return_map.loc[1]),
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def summarize_portfolio_backtest(monthly_returns: pd.DataFrame) -> pd.DataFrame:
-    if monthly_returns.empty:
-        return monthly_returns
-    grouped = (
-        monthly_returns.groupby(
-            ["model", "model_label", "split", "portfolio", "portfolio_index"], observed=True
-        )
-        .agg(
-            mean_monthly_return=("equal_weight_return", "mean"),
-            std_monthly_return=("equal_weight_return", "std"),
-            months=("equal_weight_return", "count"),
-            avg_stocks=("n_stocks", "mean"),
-            median_stocks=("n_stocks", "median"),
-            positive_month_share=("equal_weight_return", lambda s: float((s > 0).mean())),
-        )
-        .reset_index()
-    )
-    grouped["annualized_return"] = 12.0 * grouped["mean_monthly_return"]
-    grouped["annualized_volatility"] = grouped["std_monthly_return"] * np.sqrt(12.0)
-    grouped["annualized_sharpe"] = np.where(
-        grouped["std_monthly_return"].gt(0),
-        grouped["mean_monthly_return"] / grouped["std_monthly_return"] * np.sqrt(12.0),
-        np.nan,
-    )
-    grouped["t_stat"] = np.where(
-        grouped["std_monthly_return"].gt(0) & grouped["months"].gt(1),
-        grouped["mean_monthly_return"] / (grouped["std_monthly_return"] / np.sqrt(grouped["months"])),
-        np.nan,
-    )
-    cumulative = (
-        monthly_returns.sort_values(["model", "split", "portfolio_index", "month"])
-        .groupby(["model", "split", "portfolio", "portfolio_index"], observed=True)["equal_weight_return"]
-        .apply(lambda s: float((1.0 + s).prod() - 1.0))
-        .reset_index(name="cumulative_return")
-    )
-    out = grouped.merge(
-        cumulative,
-        on=["model", "split", "portfolio", "portfolio_index"],
-        how="left",
-    )
-    return out.sort_values(["split", "portfolio_index", "model_label"]).reset_index(drop=True)
-
-
-def plot_long_short_cumulative(monthly_returns: pd.DataFrame, split: str, path: Path, portfolio_count: int) -> None:
-    label = f"Q{portfolio_count}-Q1"
-    data = monthly_returns.loc[
-        monthly_returns["split"].eq(split) & monthly_returns["portfolio"].eq(label)
-    ].copy()
-    if data.empty:
-        return
-    data["month"] = pd.to_datetime(data["month"], errors="raise")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for model in MODEL_ORDER:
-        part = data.loc[data["model"].eq(model)].sort_values("month")
-        if part.empty:
-            continue
-        cumulative = (1.0 + part["equal_weight_return"]).cumprod() - 1.0
-        linewidth = 1.8 if model in {"gradient_boosting_reg", "gb_classifier"} else 1.2
-        ax.plot(part["month"], cumulative, linewidth=linewidth, label=MODEL_LABELS[model])
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title(f"{split.title()} Equal-Weight {label} Cumulative Return")
-    ax.set_xlabel("Month")
-    ax.set_ylabel("Cumulative return")
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
-
-
 def main() -> None:
     args = parse_args()
     args.table_dir.mkdir(parents=True, exist_ok=True)
@@ -434,29 +273,6 @@ def main() -> None:
     log("Reading merged prediction sample for distribution plot...")
     prediction_sample = read_prediction_sample(args.predictions, args.distribution_sample_rows)
     plot_prediction_distribution(prediction_sample, args.figure_dir / "prediction_distribution_by_model.png")
-
-    log("Running equal-weight portfolio backtests from merged predictions...")
-    predictions = read_predictions(args.predictions)
-    portfolio_monthly = build_portfolio_backtest(predictions, args.portfolio_count)
-    portfolio_summary = summarize_portfolio_backtest(portfolio_monthly)
-    portfolio_monthly_path = args.table_dir / "baseline_portfolio_monthly_returns.csv"
-    portfolio_summary_path = args.table_dir / "baseline_portfolio_backtest_summary.csv"
-    portfolio_monthly.to_csv(portfolio_monthly_path, index=False)
-    portfolio_summary.to_csv(portfolio_summary_path, index=False)
-    plot_long_short_cumulative(
-        portfolio_monthly,
-        "validation",
-        args.figure_dir / "validation_long_short_cumulative_returns.png",
-        args.portfolio_count,
-    )
-    plot_long_short_cumulative(
-        portfolio_monthly,
-        "test",
-        args.figure_dir / "test_long_short_cumulative_returns.png",
-        args.portfolio_count,
-    )
-    log(f"Saved {portfolio_monthly_path}")
-    log(f"Saved {portfolio_summary_path}")
 
     log("Writing classifier confusion matrix figures...")
     confusion = read_confusion([args.baseline_confusion, args.boosting_confusion])

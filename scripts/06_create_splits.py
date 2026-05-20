@@ -50,6 +50,11 @@ PLOT_COLORS = {
 }
 
 
+def next_calendar_month_end(dates: pd.Series) -> pd.Series:
+    month_period = pd.to_datetime(dates, errors="coerce").dt.to_period("M")
+    return month_period.add(1).dt.to_timestamp("M")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create time-based train/validation/test splits for the full feature panel."
@@ -134,15 +139,10 @@ def assert_unique_permno_month(df: pd.DataFrame) -> None:
 def add_split(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["mthcaldt"] = pd.to_datetime(out["mthcaldt"], errors="coerce")
-    out[TARGET_MONTH_COLUMN] = pd.to_datetime(out[TARGET_MONTH_COLUMN], errors="coerce")
+    out[TARGET_MONTH_COLUMN] = next_calendar_month_end(out["mthcaldt"])
     invalid_dates = int(out["mthcaldt"].isna().sum())
     if invalid_dates:
         raise ValueError(f"Cannot create splits because {invalid_dates:,} rows have invalid dates.")
-    invalid_target_months = int(out[TARGET_MONTH_COLUMN].isna().sum())
-    if invalid_target_months:
-        raise ValueError(
-            f"Cannot create splits because {invalid_target_months:,} rows have invalid target months."
-        )
 
     out = out.loc[out[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
     split = pd.Series(pd.NA, index=out.index, dtype="string")
@@ -256,10 +256,11 @@ def build_feature_coverage(
         feature: {split: 0 for split in SPLIT_ORDER} for feature in feature_columns
     }
     parquet = pq.ParquetFile(input_path)
-    columns = [TARGET_MONTH_COLUMN] + feature_columns
+    columns = ["mthcaldt"] + feature_columns
     for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
         part = batch.to_pandas()
-        part[TARGET_MONTH_COLUMN] = pd.to_datetime(part[TARGET_MONTH_COLUMN], errors="coerce")
+        part["mthcaldt"] = pd.to_datetime(part["mthcaldt"], errors="coerce")
+        part[TARGET_MONTH_COLUMN] = next_calendar_month_end(part["mthcaldt"])
         part = part.loc[part[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
         if part.empty:
             continue
@@ -405,7 +406,7 @@ def write_split_panel(input_path: Path, output_path: Path, batch_size: int) -> i
         for batch in parquet.iter_batches(batch_size=batch_size):
             part = batch.to_pandas()
             part["mthcaldt"] = pd.to_datetime(part["mthcaldt"], errors="coerce")
-            part[TARGET_MONTH_COLUMN] = pd.to_datetime(part[TARGET_MONTH_COLUMN], errors="coerce")
+            part[TARGET_MONTH_COLUMN] = next_calendar_month_end(part["mthcaldt"])
             part = part.loc[part[TARGET_MONTH_COLUMN].ge(SAMPLE_START)].copy()
             if part.empty:
                 continue
