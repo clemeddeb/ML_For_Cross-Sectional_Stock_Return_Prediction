@@ -16,6 +16,7 @@ import pandas as pd
 TRAIN_SCRIPT = Path("scripts/deep_learning/train_ft_transformer.py")
 TABLE_DIR = Path("outputs/tables")
 FIGURE_DIR = Path("outputs/figures")
+OFFICIAL_RUN_NAME = "ft_small_seed362559"
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,8 +62,6 @@ def experiment_grid() -> list[dict[str, Any]]:
             "n_heads": 4,
             "learning_rate": 5e-5,
         },
-        {"run_name": "ft_base_seed42", "seed": 42},
-        {"run_name": "ft_base_seed123", "seed": 123},
     ]
     out = []
     for spec in specs:
@@ -156,6 +155,7 @@ def summarize_run(run_name: str) -> dict[str, Any]:
 
     return {
         "run_name": selected["run_name"],
+        "is_official": selected["run_name"] == OFFICIAL_RUN_NAME,
         "seed": int(selected["seed"]),
         "selection_metric": selected["selection_metric"],
         "best_epoch": int(selected["best_epoch"]),
@@ -205,10 +205,19 @@ def build_report(summary: pd.DataFrame) -> str:
         return "\n".join(lines) + "\n"
 
     best_row = summary.sort_values("validation_classifier_rank_ic_mean", ascending=False).iloc[0]
+    official = summary.loc[summary["run_name"].eq(OFFICIAL_RUN_NAME)]
     lines.append(
         f"Best run by validation classifier Rank IC: `{best_row['run_name']}` "
         f"({best_row['validation_classifier_rank_ic_mean']:.6f})."
     )
+    if official.empty:
+        lines.append(f"Official FT-Transformer run: `{OFFICIAL_RUN_NAME}` was not available in completed outputs.")
+    else:
+        official_row = official.iloc[0]
+        lines.append(
+            f"Official FT-Transformer run: `{OFFICIAL_RUN_NAME}` "
+            f"(validation classifier Rank IC={official_row['validation_classifier_rank_ic_mean']:.6f})."
+        )
     lines.append("")
     lines.append("## Epoch 1 Check")
     for _, row in summary.sort_values("run_name").iterrows():
@@ -259,17 +268,7 @@ def build_report(summary: pd.DataFrame) -> str:
                 f"{'yes' if best_small >= baseline_value - 0.005 else 'no'} "
                 f"(best small-run delta={best_small - baseline_value:.6f})."
             )
-    seed_rows = summary.loc[summary["run_name"].isin(["ft_base_seed362559", "ft_base_seed42", "ft_base_seed123"])]
-    if len(seed_rows) >= 2:
-        spread = float(
-            seed_rows["validation_classifier_rank_ic_mean"].max() - seed_rows["validation_classifier_rank_ic_mean"].min()
-        )
-        lines.append(
-            f"- Seed variation materially changes results: {'yes' if spread > 0.01 else 'no'} "
-            f"(spread={spread:.6f})."
-        )
-    else:
-        lines.append("- Seed variation comparison is unavailable with the current run set.")
+    lines.append("- Seed robustness runs are not part of the active grid; all active experiments use seed 362559.")
     lines.append("")
     lines.append("Test metrics are reported for final comparison only and are not used for checkpoint selection.")
     return "\n".join(lines) + "\n"
