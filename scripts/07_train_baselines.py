@@ -45,6 +45,7 @@ DEFAULT_BOOSTING_PREDICTIONS = Path("outputs/predictions/boosting_predictions.pa
 DEFAULT_MERGED_PREDICTIONS = Path("outputs/predictions/baseline_predictions_with_boosting.parquet")
 DEFAULT_TABLE_DIR = Path("outputs/tables")
 DEFAULT_MODEL_DIR = Path("outputs/models/baselines")
+DEFAULT_DEEP_MODEL_DIR = Path("outputs/models/deep_learning")
 DEFAULT_FIGURE_DIR = Path("outputs/figures")
 DEFAULT_BOOSTING_LOG = Path("outputs/logs/boosting_job.log")
 
@@ -96,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions-output", type=Path, default=DEFAULT_PREDICTIONS)
     parser.add_argument("--table-dir", type=Path, default=DEFAULT_TABLE_DIR)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--deep-model-dir", type=Path, default=DEFAULT_DEEP_MODEL_DIR)
     parser.add_argument("--figure-dir", type=Path, default=DEFAULT_FIGURE_DIR)
     parser.add_argument("--debug", action="store_true", help="Use a small deterministic sample.")
     parser.add_argument("--max-train-rows", type=int, default=None)
@@ -1117,6 +1119,7 @@ def main() -> None:
     args.merged_predictions_output.parent.mkdir(parents=True, exist_ok=True)
     args.table_dir.mkdir(parents=True, exist_ok=True)
     args.model_dir.mkdir(parents=True, exist_ok=True)
+    args.deep_model_dir.mkdir(parents=True, exist_ok=True)
     args.figure_dir.mkdir(parents=True, exist_ok=True)
     log_handle = None
     if args.only_boosting or args.merge_boosting:
@@ -1361,7 +1364,7 @@ def main() -> None:
             import torch
         except ImportError as exc:
             raise ImportError("torch is required to save the trained MLP classifier.") from exc
-        torch.save(mlp.state_dict(), args.model_dir / "mlp_classifier_state_dict.pt")
+        torch.save(mlp.state_dict(), args.deep_model_dir / "mlp_classifier_state_dict.pt")
     if gb_reg is not None:
         joblib.dump(gb_reg, args.model_dir / "gradient_boosting_regressor.joblib")
     if gb_clf is not None:
@@ -1390,6 +1393,7 @@ def main() -> None:
     log(f"Wrote metrics: {args.table_dir}")
     log(f"Wrote plots: {args.figure_dir}")
     log(f"Wrote model artifacts: {args.model_dir}")
+    log(f"Wrote deep learning artifacts: {args.deep_model_dir}")
 
 
 if __name__ == "__main__":
