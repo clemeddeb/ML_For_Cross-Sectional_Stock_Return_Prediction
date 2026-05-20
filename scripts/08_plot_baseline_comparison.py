@@ -31,7 +31,6 @@ MODEL_LABELS = {
     "ridge": "Ridge",
     "elastic_net": "Elastic Net",
     "logistic_classifier": "Logistic classifier",
-    "mlp_classifier": "MLP classifier",
     "gradient_boosting_reg": "Gradient boosting regressor",
     "gb_classifier": "Gradient boosting classifier",
 }
@@ -42,7 +41,6 @@ MODEL_ORDER = [
     "ridge",
     "elastic_net",
     "logistic_classifier",
-    "mlp_classifier",
     "gradient_boosting_reg",
     "gb_classifier",
 ]
@@ -53,7 +51,6 @@ PREDICTION_COLUMNS = {
     "ridge": "prediction_ridge",
     "elastic_net": "prediction_elastic_net",
     "logistic_classifier": "prediction_logistic_classifier_score",
-    "mlp_classifier": "prediction_mlp_score",
     "gradient_boosting_reg": "prediction_gradient_boosting_reg",
     "gb_classifier": "prediction_gb_classifier_score",
 }
@@ -215,14 +212,14 @@ def read_confusion(paths: list[Path]) -> pd.DataFrame:
             raise ValueError(f"{path} is missing columns: {sorted(missing)}")
         frames.append(frame)
     out = pd.concat(frames, ignore_index=True)
-    out = out.loc[out["model"].isin(["logistic_classifier", "mlp_classifier", "gb_classifier"])].copy()
+    out = out.loc[out["model"].isin(["logistic_classifier", "gb_classifier"])].copy()
     out = out.drop_duplicates(["model", "split", "actual_label", "predicted_label"], keep="last")
     out["model_label"] = out["model"].map(MODEL_LABELS)
     return out
 
 
 def plot_confusion(confusion: pd.DataFrame, split: str, path: Path) -> None:
-    models = ["logistic_classifier", "mlp_classifier", "gb_classifier"]
+    models = ["logistic_classifier", "gb_classifier"]
     fig, axes = plt.subplots(1, len(models), figsize=(10.5, 4.5), squeeze=False)
     max_count = 0
     matrices: dict[str, pd.DataFrame] = {}
