@@ -918,7 +918,7 @@ def train_model(
     criterion = nn.CrossEntropyLoss(weight=weights)
     eval_criterion = nn.CrossEntropyLoss(reduction="mean")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     best_selection_value = -np.inf
     best_validation_loss = np.inf
@@ -944,7 +944,7 @@ def train_model(
             tabular = tabular.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
                 logits = model(sequence, sequence_mask, tabular)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
