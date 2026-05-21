@@ -61,7 +61,10 @@ outputs/figures/*
 !outputs/figures/validation_rank_ic_by_model.png
 output/
 results/
-models/
+/models/*
+!/models/
+!/models/**/*.py
+outputs/models/
 checkpoints/
 Dataset/Linking/
 Dataset/Processed/
