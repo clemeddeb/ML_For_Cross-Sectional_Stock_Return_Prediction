@@ -158,7 +158,7 @@ def prepare_ccm(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"Missing CCM link file: {path}. "
-            "Run scripts/download_ccm_links.py first."
+            "Run scripts/data_processing/download_ccm_links.py first."
         )
 
     ccm = lower_columns(pd.read_parquet(path))
@@ -286,7 +286,7 @@ def load_crsp(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"Missing monthly CRSP input: {path}. "
-            "Run scripts/01_deduplicate_crsp.py before building linked datasets."
+            "Run scripts/data_processing/01_deduplicate_crsp.py before building linked datasets."
         )
 
     dtype = {

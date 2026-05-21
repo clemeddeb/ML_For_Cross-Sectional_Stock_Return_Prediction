@@ -5,7 +5,7 @@
 Before linking or modeling, create a deduplicated monthly CRSP target file:
 
 ```bash
-python scripts/01_deduplicate_crsp.py
+python scripts/data_processing/01_deduplicate_crsp.py
 ```
 
 This reads `Dataset/Targets/monthly_crsp.csv` without overwriting it and writes
@@ -38,14 +38,14 @@ export WRDS_PASSWORD="your_wrds_password"
 Download the CCM link table:
 
 ```bash
-python scripts/download_ccm_links.py
+python scripts/data_processing/download_ccm_links.py
 ```
 
 Build the linked project files:
 
 ```bash
-python scripts/01_deduplicate_crsp.py
-python scripts/build_linked_dataset.py
+python scripts/data_processing/01_deduplicate_crsp.py
+python scripts/data_processing/build_linked_dataset.py
 ```
 
 The generated outputs are written under `Dataset/Processed/`:
@@ -66,7 +66,7 @@ By default, Compustat observations are made available three months after `datada
 Build the base monthly modeling panel after the linked-data validation passes:
 
 ```bash
-python scripts/02_build_model_panel.py
+python scripts/data_processing/02_build_model_panel.py
 ```
 
 This reads `Dataset/Processed/crsp_compustat_panel.parquet` and writes
@@ -84,7 +84,7 @@ to `0/1/2`. The target is not used to create predictors.
 Add return-based predictors to the monthly modeling panel with:
 
 ```bash
-python scripts/03_build_return_features.py
+python scripts/data_processing/03_build_return_features.py
 ```
 
 This reads `Dataset/Processed/model_panel_monthly_base.parquet` and writes
@@ -104,7 +104,7 @@ Add date-level JKP factor-state predictors after building the return-feature
 panel:
 
 ```bash
-python scripts/04_add_jkp_features.py
+python scripts/data_processing/04_add_jkp_features.py
 ```
 
 This locates the long-format JKP factor-return parquet file, reshapes selected
@@ -123,7 +123,7 @@ Select and clean Compustat accounting predictors after adding return and JKP
 features:
 
 ```bash
-python scripts/05_select_compustat_features.py
+python scripts/data_processing/05_select_compustat_features.py
 ```
 
 This reads `Dataset/Processed/model_panel_with_return_jkp_features.parquet` and
@@ -148,7 +148,7 @@ Create reproducible train, validation, and test splits after the full feature
 panel has been built:
 
 ```bash
-python scripts/06_create_splits.py
+python scripts/data_processing/06_create_splits.py
 ```
 
 This reads `Dataset/Processed/model_panel_full_features.parquet` and writes
@@ -176,20 +176,20 @@ Train the first regression and classification baselines on the time-split
 panel with:
 
 ```bash
-python scripts/07_train_baselines.py
+python scripts/baselines/07_train_baselines.py
 ```
 
 For a fast smoke test, run:
 
 ```bash
-python scripts/07_train_baselines.py --debug
+python scripts/baselines/07_train_baselines.py --debug
 ```
 
 If the histogram gradient boosting grid is too slow for an initial full pass,
 run:
 
 ```bash
-python scripts/07_train_baselines.py --skip-boosting
+python scripts/baselines/07_train_baselines.py --skip-boosting
 ```
 
 Boosting can also be run later as a separate RCP job and merged back into the
@@ -201,7 +201,7 @@ RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> scripts/run_boosti
 
 The RCP wrapper mounts only the home PVC, writes
 `outputs/logs/boosting_job.log`, runs
-`scripts/07_train_baselines.py --only-boosting --merge-boosting`, saves
+`scripts/baselines/07_train_baselines.py --only-boosting --merge-boosting`, saves
 `outputs/predictions/boosting_predictions.parquet`, and creates
 `outputs/predictions/baseline_predictions_with_boosting.parquet`. If the full
 train split is too slow, submit a fixed training subsample while still scoring
@@ -234,20 +234,20 @@ RUNAI_UID=<your-numeric-uid> RCP_USERNAME=<your-rcp-username> \
 The merge step can also be rerun locally:
 
 ```bash
-python scripts/07_train_baselines.py --merge-boosting
+python scripts/baselines/07_train_baselines.py --merge-boosting
 ```
 
 After baseline and boosting predictions have been merged, refresh the
 diagnostic comparison figures without retraining:
 
 ```bash
-python scripts/08_plot_baseline_comparison.py
+python scripts/baselines/08_plot_baseline_comparison.py
 ```
 
 Run the consolidated backtest script with:
 
 ```bash
-python scripts/09_backtest_baselines.py
+python scripts/baselines/09_backtest_baselines.py
 ```
 
 Script `08_plot_baseline_comparison.py` now writes only model-diagnostic
@@ -309,7 +309,7 @@ scores or fitted objects.
 To mirror the raw predictor and target datasets as parquet files, run:
 
 ```bash
-python scripts/convert_raw_to_parquet.py
+python scripts/data_processing/convert_raw_to_parquet.py
 ```
 
 This writes CSV conversions and copies existing parquet inputs under `Dataset/Parquet/`, while skipping documentation files such as PDFs. Use `Dataset/Parquet/` when you need faster access to the unlinked raw data, and use `Dataset/Processed/` for the next modeling steps that require linked CRSP, Compustat, SEC filing, and earnings-call identifiers.

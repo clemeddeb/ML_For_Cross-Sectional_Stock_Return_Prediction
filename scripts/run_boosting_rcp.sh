@@ -41,7 +41,7 @@ PYTHON_BIN="${PYTHON_BIN}"
 if [[ -n "${RCP_PYTHONPATH}" ]]; then
   export PYTHONPATH="${RCP_PYTHONPATH}:\${PYTHONPATH:-}"
 fi
-"\${PYTHON_BIN}" scripts/07_train_baselines.py --only-boosting --merge-boosting --boosting-backend "${BOOSTING_BACKEND}" ${MAX_TRAIN_ARG[*]} 2>&1 | tee outputs/logs/boosting_job.log
+"\${PYTHON_BIN}" scripts/baselines/07_train_baselines.py --only-boosting --merge-boosting --boosting-backend "${BOOSTING_BACKEND}" ${MAX_TRAIN_ARG[*]} 2>&1 | tee outputs/logs/boosting_job.log
 EOF
 )
 
