@@ -77,3 +77,4 @@ Dataset/
 # IDEs
 .idea/
 .vscode/
+*.nbconvert.ipynb
