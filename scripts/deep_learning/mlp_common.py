@@ -16,7 +16,7 @@ from torch import nn
 
 
 RANDOM_SEED = 362559
-EXPECTED_FEATURE_COUNT = 98
+FULL_FEATURE_COUNT = 98
 DEFAULT_INPUT = Path("Dataset/Processed/model_panel_full_features_with_splits.parquet")
 DEFAULT_FEATURE_GROUPS = Path("outputs/sanity_checks/tables/feature_groups.json")
 DEFAULT_OUTPUT_DIR = Path("outputs/models/deep_learning")
@@ -98,8 +98,8 @@ def build_feature_list(groups: dict[str, list[str]], columns: list[str]) -> list
             if lower in FORBIDDEN_FEATURES or "target" in lower or "future" in lower:
                 raise ValueError(f"Forbidden target/date/raw-return feature selected: {feature}")
             features.append(feature)
-    if len(features) != EXPECTED_FEATURE_COUNT:
-        raise ValueError(f"Expected {EXPECTED_FEATURE_COUNT} predictive features, found {len(features)}.")
+    if not features:
+        raise ValueError("No predictive features found in feature_groups.json.")
     return features
 
 
