@@ -27,6 +27,45 @@ DEFAULT_INPUT = Path("Dataset/Processed/model_panel_full_features_with_splits.pa
 DEFAULT_FEATURE_GROUPS = Path("outputs/sanity_checks/tables/feature_groups.json")
 DEFAULT_TABLE_DIR = Path("outputs/tables")
 DEFAULT_RUN_NAME = "temporal_tabular_transformer"
+ARCHITECTURE_PRESETS: dict[str, dict[str, Any]] = {
+    "default": {},
+    "small": {
+        "d_model": 32,
+        "temporal_layers": 1,
+        "temporal_heads": 2,
+        "temporal_dropout": 0.2,
+        "tabular_d_token": 16,
+        "tabular_layers": 1,
+        "tabular_heads": 2,
+        "tabular_dropout": 0.2,
+        "fusion_hidden_dim": 128,
+        "fusion_dropout": 0.3,
+    },
+    "tiny": {
+        "d_model": 16,
+        "temporal_layers": 1,
+        "temporal_heads": 1,
+        "temporal_dropout": 0.2,
+        "tabular_d_token": 8,
+        "tabular_layers": 1,
+        "tabular_heads": 1,
+        "tabular_dropout": 0.2,
+        "fusion_hidden_dim": 64,
+        "fusion_dropout": 0.3,
+    },
+}
+PRESET_CONTROLLED_FLAGS = {
+    "d_model": "--d-model",
+    "temporal_layers": "--temporal-layers",
+    "temporal_heads": "--temporal-heads",
+    "temporal_dropout": "--temporal-dropout",
+    "tabular_d_token": "--tabular-d-token",
+    "tabular_layers": "--tabular-layers",
+    "tabular_heads": "--tabular-heads",
+    "tabular_dropout": "--tabular-dropout",
+    "fusion_hidden_dim": "--fusion-hidden-dim",
+    "fusion_dropout": "--fusion-dropout",
+}
 
 ID_COLUMNS = ["permno", "gvkey", "mthcaldt", "split"]
 TARGET_COLUMNS = ["target_ret_1m", "target_quintile", "top_bottom_label"]
@@ -89,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-output", type=Path, default=None)
     parser.add_argument("--log-output", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--architecture-preset", choices=sorted(ARCHITECTURE_PRESETS), default="default")
     parser.add_argument("--seq-len", type=int, default=24)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--temporal-layers", type=int, default=3)
@@ -105,12 +145,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--temporal-learning-rate", type=float, default=None)
+    parser.add_argument("--tabular-learning-rate", type=float, default=None)
+    parser.add_argument("--fusion-learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--class-weights", action="store_true", help="Use inverse-frequency train class weights.")
     parser.add_argument("--debug", action="store_true", help="Use a small deterministic sample and short run.")
     parser.add_argument("--init-tabular-from-ft-checkpoint", type=Path, default=None)
+    parser.add_argument("--init-tabular-from-mlp-checkpoint", type=Path, default=None)
+    parser.add_argument("--strict-tabular-init", action="store_true")
+    parser.add_argument("--freeze-tabular", action="store_true")
+    parser.add_argument("--freeze-tabular-epochs", type=int, default=0)
     return parser.parse_args()
+
+
+def cli_flag_was_provided(flag: str, argv: list[str]) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def apply_architecture_preset(args: argparse.Namespace, argv: list[str]) -> None:
+    preset = ARCHITECTURE_PRESETS[args.architecture_preset]
+    if not preset:
+        return
+    for attr, value in preset.items():
+        flag = PRESET_CONTROLLED_FLAGS[attr]
+        if not cli_flag_was_provided(flag, argv):
+            setattr(args, attr, value)
+
+
+def finalize_learning_rates(args: argparse.Namespace) -> None:
+    args.temporal_learning_rate = args.temporal_learning_rate or args.learning_rate
+    args.tabular_learning_rate = args.tabular_learning_rate or args.learning_rate
+    args.fusion_learning_rate = args.fusion_learning_rate or args.learning_rate
 
 
 def resolve_output_paths(args: argparse.Namespace) -> None:
@@ -316,6 +383,13 @@ class TrainingResult:
     best_test_classifier_rank_ic: float
     best_test_er_train_rank_ic: float
     epoch_history: pd.DataFrame
+
+
+@dataclass
+class TabularInitializationResult:
+    used: bool
+    checkpoint_type: str
+    loaded_tensors: int
 
 
 def fit_preprocessor(train_df: pd.DataFrame, feature_columns: list[str]) -> Preprocessor:
@@ -525,40 +599,25 @@ class FTTabularBranch(nn.Module):
         return self.norm(tokens[:, 0])
 
 
-class ResidualMLPBlock(nn.Module):
-    def __init__(self, dim: int, dropout: float) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
-
-
 class MLPTabularBranch(nn.Module):
     def __init__(self, n_features: int, dropout: float) -> None:
         super().__init__()
         self.output_dim = 128
-        self.net = nn.Sequential(
-            nn.LayerNorm(n_features),
-            nn.Linear(n_features, 512),
-            nn.GELU(),
+        self.input_norm = nn.LayerNorm(n_features)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(n_features, 128),
+            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            ResidualMLPBlock(128, dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
         )
+        self.output_projection = nn.Linear(32, self.output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.output_projection(self.feature_extractor(self.input_norm(x)))
 
 
 class TemporalTransformerBranch(nn.Module):
@@ -656,39 +715,151 @@ class TemporalTabularTransformerClassifier(nn.Module):
         return self.classifier(torch.cat([h_seq, h_tab, h_fused], dim=1))
 
 
-def initialize_tabular_from_ft_checkpoint(model: nn.Module, checkpoint_path: Path | None) -> bool:
-    if checkpoint_path is None:
-        return False
-    if not checkpoint_path.exists():
-        log(f"Warning: FT checkpoint not found at {checkpoint_path}; continuing with random tabular init.")
-        return False
-    if not isinstance(model.tabular_branch, FTTabularBranch):
-        log("Warning: FT checkpoint warm start is only supported for --tabular-branch ft_transformer.")
-        return False
+def warn_or_raise(message: str, strict: bool) -> None:
+    if strict:
+        raise RuntimeError(message)
+    log(f"Warning: {message}")
+
+
+def checkpoint_state_dict(payload: Any) -> dict[str, torch.Tensor]:
+    if isinstance(payload, dict):
+        for key in ["model_state_dict", "state_dict"]:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return value
+        if all(isinstance(value, torch.Tensor) for value in payload.values()):
+            return payload
+    raise ValueError("checkpoint does not contain a recognized state_dict")
+
+
+def load_checkpoint_state(path: Path, strict: bool) -> dict[str, torch.Tensor] | None:
+    if not path.exists():
+        warn_or_raise(f"Tabular checkpoint not found at {path}; continuing with random tabular init.", strict)
+        return None
     try:
-        payload = torch.load(checkpoint_path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu")
+        return checkpoint_state_dict(payload)
     except Exception as exc:
-        log(f"Warning: could not load FT checkpoint {checkpoint_path}: {exc}")
-        return False
-    source = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
+        warn_or_raise(f"Could not load tabular checkpoint {path}: {exc}; continuing with random tabular init.", strict)
+        return None
+
+
+def apply_partial_state_update(
+    model: nn.Module,
+    updates: dict[str, torch.Tensor],
+    checkpoint_path: Path,
+    checkpoint_type: str,
+    strict: bool,
+) -> TabularInitializationResult:
+    if not updates:
+        warn_or_raise(
+            f"No compatible {checkpoint_type} tabular tensors found in {checkpoint_path}; using random init.",
+            strict,
+        )
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    target = model.state_dict()
+    target.update(updates)
+    model.load_state_dict(target)
+    log(
+        f"Initialized {len(updates)} tabular tensor(s) from {checkpoint_type} checkpoint "
+        f"{checkpoint_path}."
+    )
+    return TabularInitializationResult(
+        used=True,
+        checkpoint_type=checkpoint_type,
+        loaded_tensors=len(updates),
+    )
+
+
+def initialize_tabular_from_ft_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path | None,
+    strict: bool,
+) -> TabularInitializationResult:
+    if checkpoint_path is None:
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    if not isinstance(model.tabular_branch, FTTabularBranch):
+        warn_or_raise(
+            "FT checkpoint warm start is only supported for --tabular-branch ft_transformer.",
+            strict,
+        )
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    source = load_checkpoint_state(checkpoint_path, strict)
+    if source is None:
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
     target = model.state_dict()
     updates: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
     for source_key, value in source.items():
-        if source_key.startswith("tokenizer."):
-            target_key = f"tabular_branch.{source_key}"
-        elif source_key.startswith("blocks."):
+        if source_key.startswith(("tokenizer.", "blocks.", "norm.")):
             target_key = f"tabular_branch.{source_key}"
         else:
             continue
         if target_key in target and target[target_key].shape == value.shape:
             updates[target_key] = value
-    if not updates:
-        log(f"Warning: no compatible FT tabular weights found in {checkpoint_path}; using random init.")
-        return False
-    target.update(updates)
-    model.load_state_dict(target)
-    log(f"Initialized {len(updates)} tabular tensors from FT checkpoint {checkpoint_path}.")
-    return True
+        else:
+            skipped.append(source_key)
+    if skipped:
+        log(f"Skipped {len(skipped)} incompatible FT tensor(s) from {checkpoint_path}.")
+    return apply_partial_state_update(model, updates, checkpoint_path, "ft_transformer", strict)
+
+
+def initialize_tabular_from_mlp_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path | None,
+    strict: bool,
+) -> TabularInitializationResult:
+    if checkpoint_path is None:
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    if not isinstance(model.tabular_branch, MLPTabularBranch):
+        warn_or_raise("MLP checkpoint warm start is only supported for --tabular-branch mlp.", strict)
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    source = load_checkpoint_state(checkpoint_path, strict)
+    if source is None:
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    key_map = {
+        "network.0.weight": "tabular_branch.feature_extractor.0.weight",
+        "network.0.bias": "tabular_branch.feature_extractor.0.bias",
+        "network.3.weight": "tabular_branch.feature_extractor.3.weight",
+        "network.3.bias": "tabular_branch.feature_extractor.3.bias",
+        "network.6.weight": "tabular_branch.feature_extractor.6.weight",
+        "network.6.bias": "tabular_branch.feature_extractor.6.bias",
+    }
+    target = model.state_dict()
+    updates: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    for source_key, target_key in key_map.items():
+        value = source.get(source_key)
+        if value is None:
+            skipped.append(source_key)
+            continue
+        if target_key in target and target[target_key].shape == value.shape:
+            updates[target_key] = value
+        else:
+            skipped.append(source_key)
+    if skipped:
+        log(f"Skipped {len(skipped)} incompatible/missing MLP tensor(s) from {checkpoint_path}: {skipped}")
+    return apply_partial_state_update(model, updates, checkpoint_path, "mlp", strict)
+
+
+def initialize_tabular_branch(model: nn.Module, args: argparse.Namespace) -> TabularInitializationResult:
+    if args.init_tabular_from_ft_checkpoint and args.init_tabular_from_mlp_checkpoint:
+        warn_or_raise(
+            "Provide only one tabular warm-start checkpoint, not both FT and MLP checkpoints.",
+            args.strict_tabular_init,
+        )
+        return TabularInitializationResult(used=False, checkpoint_type="", loaded_tensors=0)
+    if args.tabular_branch == "ft_transformer":
+        return initialize_tabular_from_ft_checkpoint(
+            model,
+            args.init_tabular_from_ft_checkpoint,
+            args.strict_tabular_init,
+        )
+    return initialize_tabular_from_mlp_checkpoint(
+        model,
+        args.init_tabular_from_mlp_checkpoint,
+        args.strict_tabular_init,
+    )
 
 
 @torch.no_grad()
@@ -903,6 +1074,42 @@ def class_weight_tensor(train_labels: np.ndarray, device: torch.device, enabled:
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+def set_tabular_requires_grad(model: nn.Module, requires_grad: bool) -> None:
+    for parameter in model.tabular_branch.parameters():
+        parameter.requires_grad = requires_grad
+
+
+def tabular_should_be_frozen(args: argparse.Namespace, epoch: int) -> bool:
+    return bool(args.freeze_tabular or (args.freeze_tabular_epochs and epoch <= args.freeze_tabular_epochs))
+
+
+def make_optimizer(model: TemporalTabularTransformerClassifier, args: argparse.Namespace) -> torch.optim.Optimizer:
+    fusion_parameters = list(model.seq_projection.parameters())
+    fusion_parameters += list(model.tab_projection.parameters())
+    fusion_parameters += list(model.gate.parameters())
+    fusion_parameters += list(model.classifier.parameters())
+    return torch.optim.AdamW(
+        [
+            {
+                "params": list(model.temporal_branch.parameters()),
+                "lr": args.temporal_learning_rate,
+                "name": "temporal_branch",
+            },
+            {
+                "params": list(model.tabular_branch.parameters()),
+                "lr": args.tabular_learning_rate,
+                "name": "tabular_branch",
+            },
+            {
+                "params": fusion_parameters,
+                "lr": args.fusion_learning_rate,
+                "name": "fusion",
+            },
+        ],
+        weight_decay=args.weight_decay,
+    )
+
+
 def train_model(
     model: nn.Module,
     arrays: dict[str, SplitArrays],
@@ -917,8 +1124,10 @@ def train_model(
     weights = class_weight_tensor(train_arrays.labels, device, args.class_weights)
     criterion = nn.CrossEntropyLoss(weight=weights)
     eval_criterion = nn.CrossEntropyLoss(reduction="mean")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = make_optimizer(model, args)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    set_tabular_requires_grad(model, True)
+    current_tabular_frozen = False
 
     best_selection_value = -np.inf
     best_validation_loss = np.inf
@@ -935,6 +1144,11 @@ def train_model(
     start_time = time.perf_counter()
 
     for epoch in range(1, args.max_epochs + 1):
+        freeze_tabular_now = tabular_should_be_frozen(args, epoch)
+        if freeze_tabular_now != current_tabular_frozen:
+            set_tabular_requires_grad(model, not freeze_tabular_now)
+            current_tabular_frozen = freeze_tabular_now
+            log(f"{'Freezing' if freeze_tabular_now else 'Unfreezing'} tabular branch at epoch {epoch}.")
         model.train()
         total_loss = 0.0
         total_rows = 0
@@ -980,7 +1194,11 @@ def train_model(
                 "test_classifier_rank_ic": test_classifier_ic,
                 "test_er_train_rank_ic": test_er_ic,
                 "elapsed_seconds": elapsed_seconds,
-                "learning_rate": optimizer.param_groups[0]["lr"],
+                "learning_rate": args.learning_rate,
+                "temporal_learning_rate": optimizer.param_groups[0]["lr"],
+                "tabular_learning_rate": optimizer.param_groups[1]["lr"],
+                "fusion_learning_rate": optimizer.param_groups[2]["lr"],
+                "tabular_frozen": bool(freeze_tabular_now),
             }
         )
         log(
@@ -1049,7 +1267,7 @@ def hyperparameter_row(
     result: TrainingResult,
     tabular_features: list[str],
     sequence_features: list[str],
-    ft_checkpoint_used: bool,
+    init_result: TabularInitializationResult,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -1060,6 +1278,7 @@ def hyperparameter_row(
                 "sequence_feature_count": len(sequence_features),
                 "sequence_features": "|".join(sequence_features),
                 "sequence_length": args.seq_len,
+                "architecture_preset": args.architecture_preset,
                 "d_model": args.d_model,
                 "temporal_layers": args.temporal_layers,
                 "temporal_heads": args.temporal_heads,
@@ -1072,6 +1291,9 @@ def hyperparameter_row(
                 "fusion_hidden_dim": args.fusion_hidden_dim,
                 "fusion_dropout": args.fusion_dropout,
                 "learning_rate": args.learning_rate,
+                "temporal_learning_rate": args.temporal_learning_rate,
+                "tabular_learning_rate": args.tabular_learning_rate,
+                "fusion_learning_rate": args.fusion_learning_rate,
                 "weight_decay": args.weight_decay,
                 "batch_size": args.batch_size,
                 "max_epochs": args.max_epochs,
@@ -1087,7 +1309,18 @@ def hyperparameter_row(
                 "mu_train_0": float(mu_train[0]),
                 "mu_train_1": float(mu_train[1]),
                 "mu_train_2": float(mu_train[2]),
-                "ft_checkpoint_initialization_used": bool(ft_checkpoint_used),
+                "init_tabular_from_ft_checkpoint": (
+                    str(args.init_tabular_from_ft_checkpoint) if args.init_tabular_from_ft_checkpoint else ""
+                ),
+                "init_tabular_from_mlp_checkpoint": (
+                    str(args.init_tabular_from_mlp_checkpoint) if args.init_tabular_from_mlp_checkpoint else ""
+                ),
+                "strict_tabular_init": bool(args.strict_tabular_init),
+                "tabular_checkpoint_initialization_used": bool(init_result.used),
+                "tabular_checkpoint_type": init_result.checkpoint_type,
+                "tabular_checkpoint_loaded_tensors": int(init_result.loaded_tensors),
+                "freeze_tabular": bool(args.freeze_tabular),
+                "freeze_tabular_epochs": int(args.freeze_tabular_epochs),
                 "debug": bool(args.debug),
             }
         ]
@@ -1104,7 +1337,7 @@ def save_model(
     tabular_features: list[str],
     sequence_features: list[str],
     result: TrainingResult,
-    ft_checkpoint_used: bool,
+    init_result: TabularInitializationResult,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1113,6 +1346,7 @@ def save_model(
             "n_tabular_features": len(tabular_features),
             "n_sequence_features": len(sequence_features),
             "seq_len": args.seq_len,
+            "architecture_preset": args.architecture_preset,
             "d_model": args.d_model,
             "temporal_layers": args.temporal_layers,
             "temporal_heads": args.temporal_heads,
@@ -1124,6 +1358,9 @@ def save_model(
             "tabular_dropout": args.tabular_dropout,
             "fusion_hidden_dim": args.fusion_hidden_dim,
             "fusion_dropout": args.fusion_dropout,
+            "temporal_learning_rate": args.temporal_learning_rate,
+            "tabular_learning_rate": args.tabular_learning_rate,
+            "fusion_learning_rate": args.fusion_learning_rate,
         },
         "tabular_feature_columns": tabular_features,
         "sequence_feature_columns": sequence_features,
@@ -1146,7 +1383,18 @@ def save_model(
         "best_epoch": result.best_epoch,
         "stopped_epoch": result.stopped_epoch,
         "early_stopped": result.early_stopped,
-        "ft_checkpoint_initialization_used": ft_checkpoint_used,
+        "init_tabular_from_ft_checkpoint": (
+            str(args.init_tabular_from_ft_checkpoint) if args.init_tabular_from_ft_checkpoint else ""
+        ),
+        "init_tabular_from_mlp_checkpoint": (
+            str(args.init_tabular_from_mlp_checkpoint) if args.init_tabular_from_mlp_checkpoint else ""
+        ),
+        "strict_tabular_init": bool(args.strict_tabular_init),
+        "tabular_checkpoint_initialization_used": bool(init_result.used),
+        "tabular_checkpoint_type": init_result.checkpoint_type,
+        "tabular_checkpoint_loaded_tensors": int(init_result.loaded_tensors),
+        "freeze_tabular": bool(args.freeze_tabular),
+        "freeze_tabular_epochs": int(args.freeze_tabular_epochs),
         "args": vars(args),
     }
     torch.save(payload, path)
@@ -1169,6 +1417,10 @@ def adjust_args_for_debug(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    apply_architecture_preset(args, sys.argv[1:])
+    finalize_learning_rates(args)
+    if args.freeze_tabular_epochs < 0:
+        raise ValueError("--freeze-tabular-epochs must be non-negative.")
     resolve_output_paths(args)
     adjust_args_for_debug(args)
     args.table_dir.mkdir(parents=True, exist_ok=True)
@@ -1187,19 +1439,14 @@ def main() -> None:
 
         panel = load_panel(args.input, tabular_features, sequence_features)
         assert_panel_integrity(panel, tabular_features, sequence_features)
+        if args.debug:
+            panel = apply_debug_sample(panel, args.seed).reset_index(drop=True)
+            assert_panel_integrity(panel, tabular_features, sequence_features)
         raw_sequences, raw_masks = build_raw_sequences(panel, sequence_features, args.seq_len)
         log(
             f"Built raw sequences with shape={raw_sequences.shape}; "
             f"mean_valid_steps={raw_masks.sum(axis=1).mean():.2f}"
         )
-
-        if args.debug:
-            sampled = apply_debug_sample(panel, args.seed)
-            debug_idx = sampled.index.to_numpy()
-            panel = sampled.reset_index(drop=True)
-            raw_sequences = raw_sequences[debug_idx]
-            raw_masks = raw_masks[debug_idx]
-            assert_panel_integrity(panel, tabular_features, sequence_features)
 
         train_df = panel.loc[panel["split"].eq("train")]
         train_mask = panel["split"].eq("train").to_numpy()
@@ -1225,7 +1472,7 @@ def main() -> None:
             n_tabular_features=len(tabular_features),
             args=args,
         )
-        ft_checkpoint_used = initialize_tabular_from_ft_checkpoint(model, args.init_tabular_from_ft_checkpoint)
+        init_result = initialize_tabular_branch(model, args)
         model.to(device)
         log(
             "Model architecture: "
@@ -1247,7 +1494,7 @@ def main() -> None:
         monthly_ic = monthly_rank_ic_table(predictions, args.run_name)
         metrics = classification_metric_rows(predictions, monthly_ic, losses)
         hyperparams = hyperparameter_row(
-            args, mu_train, training_result, tabular_features, sequence_features, ft_checkpoint_used
+            args, mu_train, training_result, tabular_features, sequence_features, init_result
         )
 
         predictions.to_parquet(args.predictions_output, index=False)
@@ -1265,7 +1512,7 @@ def main() -> None:
             tabular_features,
             sequence_features,
             training_result,
-            ft_checkpoint_used,
+            init_result,
         )
 
         val_classifier_ic = monthly_ic.loc[
