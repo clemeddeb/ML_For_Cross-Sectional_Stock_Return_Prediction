@@ -14,7 +14,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -75,6 +75,9 @@ SPEC_COLUMNS = [
     "one_way_cost_bps",
 ]
 SPLITS = ["validation", "test"]
+BENCHMARK_TICKER = "SPY"
+BASELINE_FAMILIES = ["Naive Momentum", "XGBoost"]
+COMPARISON_MODEL_FAMILIES = ["Naive Momentum", "XGBoost", "MLP", "FT-Transformer", "TTT", "Ensemble"]
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,17 @@ def log(message: str, debug: bool = True) -> None:
         print(message, flush=True)
 
 
+def import_yfinance() -> Any:
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        raise ImportError(
+            "yfinance is required for the SPY benchmark. Install it with:\n"
+            "  python3 -m pip install yfinance"
+        ) from exc
+    return yf
+
+
 def safe_slug(text: str) -> str:
     out = []
     for char in str(text).lower():
@@ -131,6 +145,10 @@ def safe_slug(text: str) -> str:
 
 def family_from_source_and_score(source_file: str, score_label: str) -> str:
     text = f"{source_file} {score_label}".lower()
+    if "naive_momentum" in text:
+        return "Naive Momentum"
+    if "naive_reversal" in text:
+        return "Naive Reversal"
     if "temporal_tabular" in text or "temporal" in text or "ttt" in text:
         return "TTT"
     if "ft_" in text or "ft-" in text or "ft_transformer" in text:
@@ -823,46 +841,111 @@ def summarize_spec(monthly: pd.DataFrame, benchmark: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
-def load_benchmark(output_dir: Path, warnings: list[str]) -> pd.DataFrame:
-    candidates = [
-        (output_dir / "spy_benchmark_returns.csv", "SPY"),
-        (output_dir / "equal_weight_portfolio_monthly_returns.csv", "equal_weight"),
-    ]
-    for path, name in candidates:
-        if not path.exists():
-            warnings.append(f"Benchmark file missing: {path}")
-            continue
-        df = pd.read_csv(path)
-        date_col = next((col for col in ["month", "MthCalDt", "date"] if col in df.columns), None)
-        ret_col = next(
-            (col for col in ["benchmark_return", "return", "ret", "spy_return", "market_return", "net_return"] if col in df.columns),
-            None,
-        )
-        if date_col is None or ret_col is None:
-            warnings.append(f"Could not identify date/return columns in benchmark file: {path}")
-            continue
-        out = df[[date_col, ret_col]].rename(columns={date_col: "month", ret_col: "benchmark_return"})
-        out["month"] = pd.to_datetime(out["month"], errors="coerce")
-        out["benchmark_name"] = name
-        if "split" in df.columns:
-            out["split"] = df["split"].astype(str)
+def adjusted_close_from_yfinance(benchmark: pd.DataFrame) -> pd.Series:
+    if benchmark.empty:
+        raise RuntimeError("yfinance returned no SPY data.")
+    if isinstance(benchmark.columns, pd.MultiIndex):
+        if ("Adj Close", BENCHMARK_TICKER) in benchmark.columns:
+            adj_close = benchmark[("Adj Close", BENCHMARK_TICKER)]
+        elif ("Close", BENCHMARK_TICKER) in benchmark.columns:
+            adj_close = benchmark[("Close", BENCHMARK_TICKER)]
         else:
-            out = pd.concat([out.assign(split=split) for split in SPLITS], ignore_index=True)
-        return out
-    return pd.DataFrame(columns=["month", "benchmark_return", "benchmark_name", "split"])
+            ticker_frame = benchmark.xs(BENCHMARK_TICKER, axis=1, level=-1)
+            if "Adj Close" in ticker_frame.columns:
+                adj_close = ticker_frame["Adj Close"]
+            elif "Close" in ticker_frame.columns:
+                adj_close = ticker_frame["Close"]
+            else:
+                adj_close = ticker_frame.iloc[:, 0]
+    elif "Adj Close" in benchmark.columns:
+        adj_close = benchmark["Adj Close"]
+    elif "Close" in benchmark.columns:
+        adj_close = benchmark["Close"]
+    else:
+        raise RuntimeError("Unable to locate SPY adjusted close in yfinance output.")
+    adj_close = pd.to_numeric(adj_close, errors="coerce").dropna()
+    if adj_close.empty:
+        raise RuntimeError("SPY adjusted close series is empty after cleaning.")
+    adj_close.index = pd.to_datetime(adj_close.index).tz_localize(None)
+    return adj_close
 
 
-def construct_equal_weight_benchmark(df: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
-    warnings.append("Constructed equal-weight benchmark from target_ret_1m because benchmark CSVs were unavailable.")
-    bench = (
-        df.loc[df["split"].isin(SPLITS), ["split", "MthCalDt", "target_ret_1m"]]
-        .dropna()
-        .groupby(["split", "MthCalDt"], as_index=False)["target_ret_1m"]
-        .mean()
-        .rename(columns={"MthCalDt": "month", "target_ret_1m": "benchmark_return"})
+def fetch_spy_returns(return_periods: pd.Series) -> pd.DataFrame:
+    yf = import_yfinance()
+    periods = pd.PeriodIndex(return_periods.dropna().astype(str).drop_duplicates().sort_values(), freq="M")
+    if periods.empty:
+        return pd.DataFrame(columns=["return_period", "benchmark_return"])
+    start = (periods.min() - 2).to_timestamp("M").date().isoformat()
+    end = ((periods.max() + 1).to_timestamp("M") + pd.Timedelta(days=5)).date().isoformat()
+    benchmark = yf.download(
+        BENCHMARK_TICKER,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
     )
-    bench["benchmark_name"] = "equal_weight_universe_proxy"
-    return bench
+    adj_close = adjusted_close_from_yfinance(benchmark)
+    monthly = adj_close.resample("ME").last().pct_change().dropna().rename("benchmark_return").to_frame()
+    monthly = monthly.reset_index()
+    monthly = monthly.rename(columns={monthly.columns[0]: "return_month"})
+    monthly["return_month"] = pd.to_datetime(monthly["return_month"], errors="raise")
+    monthly["return_period"] = monthly["return_month"].dt.to_period("M")
+    aligned = pd.DataFrame({"return_period": periods}).merge(
+        monthly[["return_period", "benchmark_return"]],
+        on="return_period",
+        how="left",
+        validate="one_to_one",
+    )
+    if aligned["benchmark_return"].isna().any():
+        missing = aligned.loc[aligned["benchmark_return"].isna(), "return_period"].astype(str).tolist()
+        raise RuntimeError(f"Missing SPY benchmark returns for months: {missing[:5]}")
+    return aligned.sort_values("return_period").reset_index(drop=True)
+
+
+def month_split_frame(df: pd.DataFrame) -> pd.DataFrame:
+    months = df.loc[df["split"].isin(SPLITS), ["split", "MthCalDt"]].dropna().drop_duplicates().copy()
+    months["split"] = months["split"].astype(str)
+    months["MthCalDt"] = pd.to_datetime(months["MthCalDt"], errors="raise")
+    return months
+
+
+def fetch_spy_benchmark_for_months(months: pd.DataFrame) -> pd.DataFrame:
+    if months.empty:
+        return pd.DataFrame(columns=["split", "month", "return_period", "benchmark_return", "benchmark_name"])
+    work = months.drop_duplicates(["split", "MthCalDt"]).copy()
+    work["month"] = pd.to_datetime(work["MthCalDt"], errors="raise")
+    work["return_period"] = work["month"].dt.to_period("M") + 1
+    spy = fetch_spy_returns(work["return_period"])
+    out = work[["split", "month", "return_period"]].merge(
+        spy,
+        on="return_period",
+        how="left",
+        validate="many_to_one",
+    )
+    if out["benchmark_return"].isna().any():
+        missing = out.loc[out["benchmark_return"].isna(), "return_period"].astype(str).tolist()
+        raise RuntimeError(f"Missing aligned SPY benchmark returns for months: {missing[:5]}")
+    out["benchmark_name"] = BENCHMARK_TICKER
+    return out.sort_values(["split", "month"]).reset_index(drop=True)
+
+
+def ensure_spy_benchmark(benchmark: pd.DataFrame, df: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
+    required = month_split_frame(df)
+    if benchmark.empty:
+        return fetch_spy_benchmark_for_months(required)
+    covered = benchmark[["split", "month"]].drop_duplicates()
+    missing = required.rename(columns={"MthCalDt": "month"}).merge(
+        covered,
+        on=["split", "month"],
+        how="left",
+        indicator=True,
+    )
+    if missing["_merge"].eq("left_only").any():
+        existing = benchmark[["split", "month"]].rename(columns={"month": "MthCalDt"})
+        combined = pd.concat([existing, required], ignore_index=True).drop_duplicates(["split", "MthCalDt"])
+        warnings.append("Extended SPY benchmark from yfinance to cover additional prediction months.")
+        return fetch_spy_benchmark_for_months(combined)
+    return benchmark
 
 
 def merge_rank_ic(metrics: pd.DataFrame, rank_ic: pd.DataFrame) -> pd.DataFrame:
@@ -916,9 +999,13 @@ def test_rows_for_selected(full_metrics: pd.DataFrame, selected: pd.DataFrame) -
     return test.sort_values("validation_rank")
 
 
-def compact_model_comparison(full_metrics: pd.DataFrame, preselection: pd.DataFrame) -> pd.DataFrame:
+def select_representative_specs(
+    preselection: pd.DataFrame,
+    families: Iterable[str],
+    rank_prefix: str,
+) -> pd.DataFrame:
     picks = []
-    for family in ["TTT", "XGBoost", "Baseline", "MLP", "FT-Transformer", "Ensemble"]:
+    for family in families:
         fam = preselection.loc[
             preselection["model_family"].eq(family) & preselection["pass_validation_filters"]
         ]
@@ -926,12 +1013,77 @@ def compact_model_comparison(full_metrics: pd.DataFrame, preselection: pd.DataFr
             fam = preselection.loc[preselection["model_family"].eq(family)]
         if fam.empty:
             continue
-        picks.append(fam.sort_values(["net_sharpe", "net_annualized_return"], ascending=False).head(1))
+        pick = fam.sort_values(["net_sharpe", "net_annualized_return"], ascending=False).head(1).copy()
+        pick["comparison_role"] = rank_prefix
+        picks.append(pick)
     if not picks:
         return pd.DataFrame()
-    selected_specs = pd.concat(picks, ignore_index=True)["spec_id"].tolist()
-    out = full_metrics.loc[full_metrics["spec_id"].isin(selected_specs)].copy()
-    return out.sort_values(["model_family", "split"])
+    return pd.concat(picks, ignore_index=True)
+
+
+def compact_model_comparison(
+    full_metrics: pd.DataFrame,
+    preselection: pd.DataFrame,
+    selected: pd.DataFrame,
+) -> pd.DataFrame:
+    baseline_picks = select_representative_specs(preselection, BASELINE_FAMILIES, "baseline")
+    model_picks = select_representative_specs(preselection, COMPARISON_MODEL_FAMILIES[2:], "model_representative")
+    top_picks = selected.copy()
+    if not top_picks.empty:
+        top_picks["comparison_role"] = "top_validation"
+    pieces = [part for part in [top_picks, baseline_picks, model_picks] if not part.empty]
+    if not pieces:
+        return pd.DataFrame()
+    picked = pd.concat(pieces, ignore_index=True)
+    picked = picked.drop_duplicates("spec_id", keep="first")
+    selected_specs = picked[["spec_id", "comparison_role", "validation_rank"]].copy()
+    out = full_metrics.loc[full_metrics["spec_id"].isin(selected_specs["spec_id"])].merge(
+        selected_specs,
+        on="spec_id",
+        how="left",
+        validate="many_to_one",
+    )
+    family_order = {family: idx for idx, family in enumerate(COMPARISON_MODEL_FAMILIES)}
+    out["_family_order"] = out["model_family"].map(family_order).fillna(len(family_order))
+    out["_role_order"] = out["comparison_role"].map(
+        {"top_validation": 0, "baseline": 1, "model_representative": 2}
+    ).fillna(3)
+    return (
+        out.sort_values(["_role_order", "validation_rank", "_family_order", "model_family", "split"])
+        .drop(columns=["_family_order", "_role_order"])
+        .reset_index(drop=True)
+    )
+
+
+def top_specs_spy_alpha_beta(full_metrics: pd.DataFrame, selected: pd.DataFrame) -> pd.DataFrame:
+    if selected.empty:
+        return pd.DataFrame()
+    rank_cols = ["spec_id", "validation_rank"]
+    cols = [
+        "spec_id",
+        "validation_rank",
+        "split",
+        "model_family",
+        "score_label",
+        "rule",
+        "gate_type",
+        "q",
+        "threshold",
+        "z_threshold",
+        "net_sharpe",
+        "net_annualized_return",
+        "annualized_alpha",
+        "beta",
+        "alpha_tstat",
+        "alpha_beta_months",
+    ]
+    out = full_metrics.loc[full_metrics["spec_id"].isin(selected["spec_id"])].merge(
+        selected[rank_cols],
+        on="spec_id",
+        how="left",
+        validate="many_to_one",
+    )
+    return out[cols].sort_values(["validation_rank", "split"]).reset_index(drop=True)
 
 
 def cumulative_wealth(returns: pd.Series, months: pd.Series) -> pd.Series:
@@ -1057,6 +1209,7 @@ def write_report(
     best_specs: pd.DataFrame,
     best_test: pd.DataFrame,
     comparison: pd.DataFrame,
+    top_alpha_beta: pd.DataFrame,
     warnings: list[str],
 ) -> Path:
     path = output_dir / "portfolio_analysis_report_25bps.md"
@@ -1088,6 +1241,8 @@ def write_report(
     lines.append(table_block(top10))
     lines.extend(["", "## Test Performance of Top Validation Specs", ""])
     lines.append(table_block(best_test.head(10)))
+    lines.extend(["", "## SPY Alpha/Beta for Top Validation Specs", ""])
+    lines.append(table_block(top_alpha_beta.head(20)))
     lines.extend(["", "## Best Model Comparison", ""])
     lines.append(table_block(comparison))
     lines.extend(
@@ -1096,6 +1251,9 @@ def write_report(
             "## Method Notes and Caveats",
             "",
             "- Scores at month t are used with `target_ret_1m`, which is the next-month return already stored in the prediction rows.",
+            "- SPY is fetched from yfinance and used as the market proxy for both benchmark plots and alpha/beta regressions.",
+            "- The SPY benchmark is aligned so each formation month t receives SPY's return in calendar month t+1.",
+            "- Naive momentum and XGBoost are retained as explicit baseline representatives in the comparison outputs.",
             "- Turnover uses drift-adjusted previous weights whenever the previous portfolio gross return is finite and greater than -100%.",
             "- The notebook absolute-threshold grid was extended to include `0.005` by default, as requested by the script CLI.",
             "- Z-score threshold strategies are included as raw threshold strategies only. Risk overlays are intentionally excluded.",
@@ -1116,7 +1274,7 @@ def main() -> None:
     warnings_list: list[str] = []
     strategy_grid = build_strategy_grid(args)
     prediction_files = discover_prediction_files(args.prediction_dir, warnings_list)
-    benchmark = load_benchmark(output_dir, warnings_list)
+    benchmark = pd.DataFrame(columns=["split", "month", "return_period", "benchmark_return", "benchmark_name"])
 
     all_monthly = []
     all_metrics = []
@@ -1124,7 +1282,6 @@ def main() -> None:
     loaded_files = []
     score_count = 0
     evaluated_specs = 0
-    benchmark_constructed = False
 
     for path in prediction_files:
         log(f"Loading {path.name}", args.debug)
@@ -1139,9 +1296,7 @@ def main() -> None:
             continue
         loaded_files.append(path.name)
         score_count += len(scores)
-        if benchmark.empty and not benchmark_constructed:
-            benchmark = construct_equal_weight_benchmark(df, warnings_list)
-            benchmark_constructed = True
+        benchmark = ensure_spy_benchmark(benchmark, df, warnings_list)
         log(f"  usable scores: {len(scores)}", args.debug)
         for score in scores:
             valid_scores = df.loc[df["split"].isin(SPLITS), score.score_column]
@@ -1188,7 +1343,8 @@ def main() -> None:
     preselection = validation_preselection(full_metrics, args)
     best_specs = select_best_specs(preselection, args.top_n)
     best_test = test_rows_for_selected(full_metrics, best_specs)
-    comparison = compact_model_comparison(full_metrics, preselection)
+    comparison = compact_model_comparison(full_metrics, preselection, best_specs)
+    top_alpha_beta = top_specs_spy_alpha_beta(full_metrics, best_specs)
 
     if "split" in benchmark.columns and benchmark["split"].ne("").any():
         monthly_with_bench = monthly_returns.merge(
@@ -1203,10 +1359,12 @@ def main() -> None:
             how="left",
         )
 
+    benchmark.to_csv(output_dir / "spy_benchmark_returns.csv", index=False)
     full_metrics.to_csv(output_dir / "portfolio_full_grid_metrics_25bps.csv", index=False)
     preselection.to_csv(output_dir / "portfolio_validation_preselection_25bps.csv", index=False)
     best_specs.to_csv(output_dir / "portfolio_best_specs_validation_25bps.csv", index=False)
     best_test.to_csv(output_dir / "portfolio_best_specs_test_25bps.csv", index=False)
+    top_alpha_beta.to_csv(output_dir / "portfolio_top_specs_spy_alpha_beta_25bps.csv", index=False)
     comparison.to_csv(output_dir / "portfolio_selected_model_comparison_25bps.csv", index=False)
     monthly_with_bench.to_csv(output_dir / "portfolio_monthly_returns_25bps.csv", index=False)
 
@@ -1220,6 +1378,7 @@ def main() -> None:
         best_specs,
         best_test,
         comparison,
+        top_alpha_beta,
         warnings_list,
     )
 
@@ -1245,10 +1404,12 @@ def main() -> None:
     print(best_specs[cols].head(5).to_string(index=False) if not best_specs.empty else "None")
     print("Files created:")
     for path in [
+        output_dir / "spy_benchmark_returns.csv",
         output_dir / "portfolio_full_grid_metrics_25bps.csv",
         output_dir / "portfolio_validation_preselection_25bps.csv",
         output_dir / "portfolio_best_specs_validation_25bps.csv",
         output_dir / "portfolio_best_specs_test_25bps.csv",
+        output_dir / "portfolio_top_specs_spy_alpha_beta_25bps.csv",
         output_dir / "portfolio_selected_model_comparison_25bps.csv",
         output_dir / "portfolio_monthly_returns_25bps.csv",
         report_path,
