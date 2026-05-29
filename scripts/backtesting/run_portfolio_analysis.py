@@ -53,13 +53,10 @@ TARGET_AND_ID_COLUMNS = {
     "top_bottom_label",
 }
 EXPECTED_PREDICTION_FILES = [
-    "baseline_predictions.parquet",
     "baseline_predictions_with_boosting.parquet",
-    "boosting_predictions.parquet",
     "dl_xgb_predictions.parquet",
     "ft_transformer_predictions.parquet",
     "temporal_tabular_backtest_predictions.parquet",
-    "temporal_tabular_transformer_seed362559_predictions.parquet",
 ]
 SPEC_COLUMNS = [
     "spec_id",

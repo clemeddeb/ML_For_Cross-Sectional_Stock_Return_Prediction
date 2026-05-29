@@ -1,0 +1,7 @@
+run_name,run_label,rows,first_month,last_month,classifier_nonnull,er_train_nonnull
+temporal_tabular_tiny_random,tiny_random,3109092,1989-12-29,2024-10-31,3109092,3109092
+temporal_tabular_small_random,small_random,3109092,1989-12-29,2024-10-31,3109092,3109092
+temporal_tabular_small_mlp_branch,small_mlp_branch,3109092,1989-12-29,2024-10-31,3109092,3109092
+temporal_tabular_transformer_seed362559,default_seed362559,3109092,1989-12-29,2024-10-31,3109092,3109092
+temporal_tabular_small_ft_warmstart,small_ft_warmstart,3109092,1989-12-29,2024-10-31,3109092,3109092
+temporal_tabular_small_mlp_warmstart,small_mlp_warmstart,3109092,1989-12-29,2024-10-31,3109092,3109092

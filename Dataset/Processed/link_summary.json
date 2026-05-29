@@ -1,0 +1,32 @@
+{
+  "crsp_compustat_panel": {
+    "compustat_match_pct": 91.46,
+    "compustat_matched_rows": 4144726,
+    "gvkey_match_pct": 100.0,
+    "gvkey_matched_rows": 4531789,
+    "permno_nonmissing_pct": 100.0,
+    "permno_nonmissing_rows": 4531789,
+    "rows": 4531789
+  },
+  "crsp_with_gvkey": {
+    "gvkey_match_pct": 87.49,
+    "gvkey_matched_rows": 4531789,
+    "permno_nonmissing_pct": 100.0,
+    "permno_nonmissing_rows": 5179742,
+    "rows": 5179742
+  },
+  "earnings_calls_with_gvkey": {
+    "gvkey_match_pct": 99.82,
+    "gvkey_matched_rows": 35208,
+    "permno_nonmissing_pct": 100.0,
+    "permno_nonmissing_rows": 35271,
+    "rows": 35271
+  },
+  "sec_10k_with_links": {
+    "gvkey_match_pct": 68.3,
+    "gvkey_matched_rows": 5684,
+    "permno_nonmissing_pct": 52.45,
+    "permno_nonmissing_rows": 4365,
+    "rows": 8322
+  }
+}

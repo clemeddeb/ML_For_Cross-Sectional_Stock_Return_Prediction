@@ -1,0 +1,4 @@
+Model family,Model,Score,Mean Rank IC (val),Mean Rank IC (test),IC hit rate,Top-bottom spread
+TTT,TTT tiny random,classifier,0.0975^{***},0.1028^{***},82.24%,0.0094
+TTT,TTT small random,classifier,0.0931^{***},0.0897^{***},80.37%,0.0093
+TTT,TTT small MLP branch,classifier,0.0912^{***},0.0948^{***},79.44%,0.0104^{*}

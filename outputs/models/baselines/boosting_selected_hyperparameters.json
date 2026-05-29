@@ -1,0 +1,14 @@
+{
+  "gradient_boosting_reg": {
+    "max_iter": 300,
+    "learning_rate": 0.03,
+    "max_leaf_nodes": 31,
+    "backend": "xgboost_gpu"
+  },
+  "gb_classifier": {
+    "max_iter": 300,
+    "learning_rate": 0.03,
+    "max_leaf_nodes": 31,
+    "backend": "xgboost_gpu"
+  }
+}

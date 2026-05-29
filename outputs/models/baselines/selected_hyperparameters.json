@@ -1,0 +1,24 @@
+{
+  "naive_momentum": {
+    "feature": "momentum_12m_excl_1m",
+    "missing_fill": 0.04386795312166214
+  },
+  "naive_reversal": {
+    "feature": "negative ret_lag_1m",
+    "missing_fill": 0.0
+  },
+  "ridge": {
+    "alpha": 100.0
+  },
+  "elastic_net": {
+    "alpha": 0.01,
+    "l1_ratio": 0.5,
+    "estimator": "SGDRegressor_elasticnet"
+  },
+  "logistic_classifier": {
+    "C": 0.01,
+    "alpha": 5.468760253925476e-05,
+    "class_weight": "none",
+    "estimator": "SGDClassifier_log_loss"
+  }
+}

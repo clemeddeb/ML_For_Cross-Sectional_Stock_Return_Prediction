@@ -1,0 +1,7 @@
+Model family,Model,Score,Val Rank IC,Val t-stat,Val IC hit rate,Val top-bottom spread,Test Rank IC,Test t-stat,Test IC hit rate,Test top-bottom spread
+XGB,XGB,classifier,0.0748,5.9758,83.33%,0.0103,0.0795,6.3979,75.70%,0.0112
+MLP,MLP,classifier,0.0736,6.3431,85.00%,0.0091,0.0957,7.7344,78.50%,0.0104
+FT-Transformer,FT-Transformer main,classifier,0.0936,5.9726,78.33%,0.0111,0.0933,6.1905,73.83%,0.0074
+FT-Transformer,FT-Transformer small lr5e-5 seed362559,classifier,0.0925,6.1470,78.33%,0.0111,0.0911,6.1960,74.77%,0.0074
+TTT,TTT tiny random,classifier,0.0975,7.5345,88.33%,0.0132,0.1028,8.2536,82.24%,0.0094
+TTT,TTT small random,classifier,0.0931,6.5037,81.67%,0.0128,0.0897,7.0527,80.37%,0.0093

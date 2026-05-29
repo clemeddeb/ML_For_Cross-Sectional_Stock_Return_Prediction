@@ -1,0 +1,7 @@
+model,model_family,task,source,best_epoch,best_validation_monthly_rank_ic
+mlp_classifier,MLP,classification,outputs/models/deep_learning/mlp_model.pt,1.0,0.07356423989221464
+mlp_regressor,MLP,regression,outputs/models/deep_learning/regression/mlp_regressor.pt,3.0,0.01767675924158864
+xgb_regressor,XGBoost,regression,outputs/predictions/baseline_predictions_with_boosting.parquet,,
+xgb_classifier,XGBoost,classification,outputs/predictions/baseline_predictions_with_boosting.parquet,,
+ft_classifier_small,FTTransformer,classification,outputs/predictions/ft_transformer_predictions.parquet,,
+temporal_transformer,TemporalTransformer,classification,outputs/predictions/temporal_tabular_transformer_seed362559_predictions.parquet,,

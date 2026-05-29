@@ -1,0 +1,2 @@
+outputs/predictions/*.parquet filter=lfs diff=lfs merge=lfs -text
+outputs/backtests/portfolio_monthly_returns_25bps.csv filter=lfs diff=lfs merge=lfs -text

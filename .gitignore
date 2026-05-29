@@ -1,80 +1,67 @@
-# macOS
+# Operating system files
 .DS_Store
 
-# Python
+# Python caches and local environments
 __pycache__/
 *.py[cod]
 *$py.class
 .python-version
-
-# Virtual environments
 .venv/
 venv/
 env/
 ENV/
 
-# Jupyter
+# Jupyter notebooks are prohibited in the final submission
+*.ipynb
+*.nbconvert.ipynb
 .ipynb_checkpoints/
 
-# Testing and coverage
+# Testing, coverage, and editor caches
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Type checkers and linters
 .mypy_cache/
 .ruff_cache/
 .pyright/
+.idea/
+.vscode/
 
-# Logs
-*.log
-
-# Environment variables and local config
+# Secrets and local config
 .env
 .env.*
 !.env.example
 
-# Generated artifacts
-outputs/*
-!outputs/tables/
-outputs/tables/*
-!outputs/tables/baseline_all_model_rank_ic_summary.csv
-!outputs/tables/baseline_classifier_confusion_matrices.csv
-!outputs/tables/baseline_classifier_metrics.csv
-!outputs/tables/baseline_feature_list.csv
-!outputs/tables/baseline_model_selection_summary.csv
-!outputs/tables/baseline_monthly_rank_ic.csv
-!outputs/tables/baseline_regression_metrics.csv
-!outputs/tables/baseline_selected_hyperparameters.csv
-!outputs/tables/baseline_warnings.txt
-!outputs/tables/boosting_classifier_confusion_matrices.csv
-!outputs/tables/boosting_model_metrics.csv
-!outputs/tables/boosting_monthly_rank_ic.csv
-!outputs/tables/boosting_selected_hyperparameters.csv
-!outputs/figures/
-outputs/figures/*
-!outputs/figures/classifier_confusion_matrix_test.png
-!outputs/figures/classifier_confusion_matrix_validation.png
-!outputs/figures/monthly_rank_ic_over_time.png
-!outputs/figures/prediction_distribution_by_model.png
-!outputs/figures/test_rank_ic_by_model.png
-!outputs/figures/validation_rank_ic_by_model.png
+# Logs, process files, and cluster/Run:AI artifacts
+*.log
+*.pid
+*.out
+*.err
+outputs/logs/
+runai/
+runai*/
+*runai*
+*_job.log
+
+# Local large CSV and generated processed data may be kept in the working tree,
+# but the lightweight parquet rebuild inputs are preferred for git submission.
+Dataset/Predictors/CompFirmCharac.csv
+Dataset/Predictors/[usa]_[all_factors]_[monthly]_[vw_cap].csv
+Dataset/Targets/monthly_crsp.csv
+Dataset/Processed/*.parquet
+
+# Temporary or debug artifacts
+checkpoints/
 output/
 results/
-/models/*
-!/models/
-!/models/**/*.py
-outputs/models/
-checkpoints/
-Dataset/Linking/
-Dataset/Processed/
-Dataset/Parquet/
+outputs/sanity_checks/
+outputs/figures/
+outputs/**/__pycache__/
+outputs/predictions/*debug*.parquet
+outputs/models/deep_learning/temporal_tabular_debug*.pt
+outputs/tables/*debug*
 
-# Data
-dataset/
-Dataset/
-
-# IDEs
-.idea/
-.vscode/
-*.nbconvert.ipynb
+# Final artifacts intentionally kept in git:
+# - outputs/predictions/*.parquet
+# - outputs/models/**/*.pt, *.joblib, *.json
+# - outputs/tables/*.csv and *.md
+# - outputs/backtests/*.csv, *.md, and figures/*.png

@@ -1,0 +1,3 @@
+Model family,Model,Score,Mean Rank IC (val),Mean Rank IC (test),IC hit rate,Top-bottom spread
+MLP,MLP,classifier,0.0736^{***},0.0957^{***},78.50%,0.0104^{*}
+MLP,MLP,ER_train,0.0397^{**},0.0738^{***},78.50%,0.0123^{***}

@@ -1,0 +1,11 @@
+Model family,Model,Score,Mean Rank IC (val),Mean Rank IC (test),IC hit rate,Top-bottom spread
+XGB,XGB,classifier,0.0748^{***},0.0795^{***},75.70%,0.0112^{**}
+XGB,XGB,ER_train,0.0196,0.0085,55.14%,0.0074^{*}
+MLP,MLP,classifier,0.0736^{***},0.0957^{***},78.50%,0.0104^{*}
+MLP,MLP,ER_train,0.0397^{**},0.0738^{***},78.50%,0.0123^{***}
+FT-Transformer,FT-Transformer main,classifier,0.0936^{***},0.0933^{***},73.83%,0.0074
+FT-Transformer,FT-Transformer small lr5e-5 seed362559,classifier,0.0925^{***},0.0911^{***},74.77%,0.0074
+FT-Transformer,FT-Transformer main,ER_train,0.0867^{***},0.0856^{***},78.50%,0.0117^{**}
+TTT,TTT tiny random,classifier,0.0975^{***},0.1028^{***},82.24%,0.0094
+TTT,TTT small random,classifier,0.0931^{***},0.0897^{***},80.37%,0.0093
+TTT,TTT small MLP branch,classifier,0.0912^{***},0.0948^{***},79.44%,0.0104^{*}

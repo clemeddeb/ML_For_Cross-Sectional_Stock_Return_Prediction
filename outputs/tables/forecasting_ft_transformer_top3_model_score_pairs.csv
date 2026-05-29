@@ -1,0 +1,4 @@
+Model family,Model,Score,Mean Rank IC (val),Mean Rank IC (test),IC hit rate,Top-bottom spread
+FT-Transformer,FT-Transformer main,classifier,0.0936^{***},0.0933^{***},73.83%,0.0074
+FT-Transformer,FT-Transformer small lr5e-5 seed362559,classifier,0.0925^{***},0.0911^{***},74.77%,0.0074
+FT-Transformer,FT-Transformer main,ER_train,0.0867^{***},0.0856^{***},78.50%,0.0117^{**}

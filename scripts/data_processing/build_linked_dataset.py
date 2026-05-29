@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 
 DEFAULT_CCM = Path("Dataset/Linking/ccm_links.parquet")
 DEFAULT_CRSP = Path("Dataset/Processed/crsp_monthly_deduped.parquet")
-DEFAULT_COMPUSTAT = Path("Dataset/Predictors/CompFirmCharac.csv")
+DEFAULT_COMPUSTAT = Path("Dataset/Parquet/Predictors/CompFirmCharac_parquet")
 DEFAULT_10K = Path("Dataset/Predictors/10K_fillings.parquet")
 DEFAULT_CALLS = Path("Dataset/Predictors/sm-calls_with_connectors.parquet")
 DEFAULT_OUTPUT_DIR = Path("Dataset/Processed")
@@ -139,7 +139,10 @@ def lower_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def existing_columns(path: Path, requested: Iterable[str]) -> list[str]:
-    header = pd.read_csv(path, nrows=0).columns
+    if path.suffix.lower() == ".parquet" or path.is_dir():
+        header = pq.ParquetDataset(path).schema.names if path.is_dir() else pq.ParquetFile(path).schema_arrow.names
+    else:
+        header = pd.read_csv(path, nrows=0).columns
     available = {c.lower(): c for c in header}
     cols = []
     missing = []
@@ -310,6 +313,14 @@ def load_crsp(path: Path) -> pd.DataFrame:
 
 
 def load_compustat(path: Path, compustat_cols: list[str]) -> pd.DataFrame:
+    if not path.exists():
+        fallback = Path("Dataset/Predictors/CompFirmCharac.csv")
+        if path == DEFAULT_COMPUSTAT and fallback.exists():
+            print(f"Default Compustat parquet not found at {path}; falling back to {fallback}.")
+            path = fallback
+        else:
+            raise FileNotFoundError(f"Missing Compustat firm-characteristics input: {path}")
+
     if compustat_cols == ["all"]:
         usecols = None
     else:
@@ -323,10 +334,16 @@ def load_compustat(path: Path, compustat_cols: list[str]) -> pd.DataFrame:
         "cusip": "string",
         "conm": "string",
     }
-    try:
-        comp = pd.read_csv(path, usecols=usecols, dtype=dtype, engine="pyarrow")
-    except (ImportError, ValueError):
-        comp = pd.read_csv(path, usecols=usecols, dtype=dtype, low_memory=False)
+    if path.suffix.lower() == ".parquet" or path.is_dir():
+        comp = pd.read_parquet(path, columns=usecols)
+        for col, dtype_name in dtype.items():
+            if col in comp.columns:
+                comp[col] = comp[col].astype(dtype_name)
+    else:
+        try:
+            comp = pd.read_csv(path, usecols=usecols, dtype=dtype, engine="pyarrow")
+        except (ImportError, ValueError):
+            comp = pd.read_csv(path, usecols=usecols, dtype=dtype, low_memory=False)
     comp = lower_columns(comp)
     comp["gvkey"] = normalize_gvkey(comp["gvkey"])
     comp["datadate"] = pd.to_datetime(comp["datadate"], errors="coerce")
@@ -706,36 +723,49 @@ def main() -> None:
     print("Wrote crsp_compustat_panel.parquet.", flush=True)
     del crsp, crsp_with_gvkey
 
-    print("Linking SEC 10-K filings by CIK, then to CCM...", flush=True)
-    sec_10k = link_sec_10k(
-        args.sec_10k_path,
-        comp,
-        ccm,
-        drop_text=args.drop_text,
-        tolerance_days=args.sec_match_tolerance_days,
-    )
-    sec_10k.to_parquet(args.output_dir / "sec_10k_with_links.parquet", index=False)
-    print("Wrote sec_10k_with_links.parquet.", flush=True)
-    summary["sec_10k_with_links"] = build_summary_item(
-        sec_10k,
-        crsp_input_path=args.crsp_path,
-        deduplicated_crsp_used=deduplicated_crsp_used,
-    )
-    del sec_10k, comp
+    if args.sec_10k_path.exists():
+        print("Linking SEC 10-K filings by CIK, then to CCM...", flush=True)
+        sec_10k = link_sec_10k(
+            args.sec_10k_path,
+            comp,
+            ccm,
+            drop_text=args.drop_text,
+            tolerance_days=args.sec_match_tolerance_days,
+        )
+        sec_10k.to_parquet(args.output_dir / "sec_10k_with_links.parquet", index=False)
+        print("Wrote sec_10k_with_links.parquet.", flush=True)
+        summary["sec_10k_with_links"] = build_summary_item(
+            sec_10k,
+            crsp_input_path=args.crsp_path,
+            deduplicated_crsp_used=deduplicated_crsp_used,
+        )
+        del sec_10k
+    else:
+        print(
+            f"Optional SEC 10-K input not found at {args.sec_10k_path}; skipping text-link output.",
+            flush=True,
+        )
+    del comp
 
-    print("Linking earnings calls by PERMNO to CCM...", flush=True)
-    calls_summary = write_calls_with_gvkey(
-        args.calls_path,
-        args.output_dir / "earnings_calls_with_gvkey.parquet",
-        ccm,
-        drop_text=args.drop_text,
-    )
-    print("Wrote earnings_calls_with_gvkey.parquet.", flush=True)
-    summary["earnings_calls_with_gvkey"] = add_crsp_input_metadata(
-        calls_summary,
-        crsp_input_path=args.crsp_path,
-        deduplicated_crsp_used=deduplicated_crsp_used,
-    )
+    if args.calls_path.exists():
+        print("Linking earnings calls by PERMNO to CCM...", flush=True)
+        calls_summary = write_calls_with_gvkey(
+            args.calls_path,
+            args.output_dir / "earnings_calls_with_gvkey.parquet",
+            ccm,
+            drop_text=args.drop_text,
+        )
+        print("Wrote earnings_calls_with_gvkey.parquet.", flush=True)
+        summary["earnings_calls_with_gvkey"] = add_crsp_input_metadata(
+            calls_summary,
+            crsp_input_path=args.crsp_path,
+            deduplicated_crsp_used=deduplicated_crsp_used,
+        )
+    else:
+        print(
+            f"Optional earnings-call input not found at {args.calls_path}; skipping text-link output.",
+            flush=True,
+        )
 
     write_summary(args.output_dir, summary)
 

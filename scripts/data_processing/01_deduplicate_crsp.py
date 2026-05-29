@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("Dataset/Targets/monthly_crsp.csv")
+DEFAULT_INPUT = Path("Dataset/Parquet/Targets/monthly_crsp.parquet")
 DEFAULT_OUTPUT = Path("Dataset/Processed/crsp_monthly_deduped.parquet")
 DEFAULT_AUDIT = Path("outputs/sanity_checks/tables/crsp_dedup_audit.csv")
 DEFAULT_CONFLICTS = Path("outputs/sanity_checks/tables/crsp_core_field_conflicts.csv")
@@ -53,20 +53,28 @@ def is_placeholder(series: pd.Series) -> pd.Series:
 
 def read_crsp(path: Path) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(f"Missing raw CRSP file: {path}")
+        fallback = Path("Dataset/Targets/monthly_crsp.csv")
+        if path == DEFAULT_INPUT and fallback.exists():
+            print(f"Default CRSP parquet not found at {path}; falling back to {fallback}.")
+            path = fallback
+        else:
+            raise FileNotFoundError(f"Missing raw CRSP file: {path}")
 
-    df = pd.read_csv(
-        path,
-        dtype={
-            "PERMNO": "Int64",
-            "PERMCO": "Int64",
-            "HdrCUSIP": "string",
-            "CUSIP": "string",
-            "Ticker": "string",
-            "TradingSymbol": "string",
-        },
-        low_memory=False,
-    )
+    dtype = {
+        "PERMNO": "Int64",
+        "PERMCO": "Int64",
+        "HdrCUSIP": "string",
+        "CUSIP": "string",
+        "Ticker": "string",
+        "TradingSymbol": "string",
+    }
+    if path.suffix.lower() == ".parquet":
+        df = pd.read_parquet(path)
+        for col, dtype_name in dtype.items():
+            if col in df.columns:
+                df[col] = df[col].astype(dtype_name)
+    else:
+        df = pd.read_csv(path, dtype=dtype, low_memory=False)
     missing = set(KEY_COLUMNS + CORE_COLUMNS + METADATA_PRIORITY_COLUMNS).difference(df.columns)
     if missing:
         raise ValueError(f"Raw CRSP file is missing required columns: {sorted(missing)}")

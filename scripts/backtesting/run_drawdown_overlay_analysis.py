@@ -462,7 +462,8 @@ def write_figures(output_dir: Path, monthly: pd.DataFrame, summary: pd.DataFrame
     if test_summary.empty:
         return paths
 
-    plot_specs = test_summary.sort_values(["spec_id", "overlay_method"])["spec_id"].drop_duplicates().head(5).tolist()
+    sort_cols = [col for col in ["validation_rank", "spec_id", "overlay_method"] if col in test_summary.columns]
+    plot_specs = test_summary.sort_values(sort_cols)["spec_id"].drop_duplicates().head(5).tolist()
     plot_monthly = monthly.loc[monthly["split"].eq("test") & monthly["spec_id"].isin(plot_specs)].copy()
 
     for spec_id, part in plot_monthly.groupby("spec_id", sort=False):
