@@ -1102,6 +1102,245 @@ def drawdown_series(returns: pd.Series, months: pd.Series) -> pd.Series:
     return wealth / wealth.cummax() - 1.0
 
 
+def figure_strategy_label(row: pd.Series) -> str:
+    family = str(row.get("model_family", "Strategy"))
+    rule = str(row.get("rule", ""))
+    q = row.get("q")
+    gate = str(row.get("gate_type", "none"))
+    threshold = row.get("threshold")
+    score = str(row.get("score_label", "")).split("__")[-1]
+    parts = [family]
+    if family == "TTT" and pd.notna(row.get("validation_rank")):
+        parts.append(f"rank {int(row['validation_rank'])}")
+    if family in {"Naive Momentum", "XGBoost", "MLP", "FT-Transformer"} and score:
+        parts.append(score.replace("_", " ")[:28])
+    if rule:
+        parts.append(rule.replace("_", " "))
+    if pd.notna(q):
+        parts.append(f"q={float(q):.0%}")
+    if gate == "absolute" and pd.notna(threshold):
+        parts.append(f"thr={float(threshold):g}")
+    elif gate == "zscore" and pd.notna(row.get("z_threshold")):
+        parts.append(f"z={float(row['z_threshold']):g}")
+    return " | ".join(parts)
+
+
+def select_figure_specs(
+    full_metrics: pd.DataFrame,
+    selected: pd.DataFrame,
+    comparison: pd.DataFrame,
+    ttt_top_n: int = 5,
+) -> pd.DataFrame:
+    picks = []
+    seen = set()
+
+    def add_rows(rows: pd.DataFrame, role: str) -> None:
+        for _, row in rows.iterrows():
+            spec_id = row["spec_id"]
+            if spec_id in seen:
+                continue
+            picked = row.copy()
+            picked["figure_role"] = role
+            picked["figure_order"] = len(picks) + 1
+            picks.append(picked)
+            seen.add(spec_id)
+
+    add_rows(selected.head(ttt_top_n), "top_validation_ttt")
+
+    comp_val = comparison.loc[comparison["split"].eq("validation")].copy() if not comparison.empty else pd.DataFrame()
+    val = full_metrics.loc[full_metrics["split"].eq("validation")].copy()
+    for family in ["Naive Momentum", "XGBoost", "MLP", "FT-Transformer"]:
+        family_rows = comp_val.loc[comp_val["model_family"].eq(family)]
+        if family_rows.empty:
+            family_rows = val.loc[val["model_family"].eq(family)].sort_values(
+                ["net_sharpe", "net_annualized_return"],
+                ascending=False,
+            )
+        add_rows(family_rows.head(1), f"best_{safe_slug(family)}")
+
+    if not picks:
+        return pd.DataFrame()
+    picked = pd.DataFrame(picks)
+    figure_cols = ["spec_id", "figure_role", "figure_order"]
+    if "validation_rank" in picked.columns:
+        figure_cols.append("validation_rank")
+    out = full_metrics.loc[full_metrics["spec_id"].isin(picked["spec_id"])].merge(
+        picked[figure_cols].drop_duplicates("spec_id"),
+        on="spec_id",
+        how="left",
+        validate="many_to_one",
+    )
+    return out.sort_values(["figure_order", "split"]).reset_index(drop=True)
+
+
+def selected_strategy_display_name(row: pd.Series) -> str:
+    rank = int(row["validation_rank"]) if pd.notna(row.get("validation_rank")) else None
+    if rank == 1:
+        return "Main selected TTT"
+    if rank == 3:
+        return "Risk-balanced TTT"
+    return figure_strategy_label(row)
+
+
+def period_max_drawdown(returns: pd.Series) -> float:
+    clean = returns.fillna(0.0)
+    if clean.empty:
+        return np.nan
+    wealth = pd.concat([pd.Series([1.0]), (1.0 + clean).cumprod().reset_index(drop=True)], ignore_index=True)
+    return float((wealth / wealth.cummax() - 1.0).min())
+
+
+def selected_annual_return_mdd(monthly: pd.DataFrame, selected: pd.DataFrame) -> pd.DataFrame:
+    target = selected.loc[selected["validation_rank"].isin([1, 3])].copy()
+    if target.empty:
+        return pd.DataFrame()
+    target["strategy_name"] = target.apply(selected_strategy_display_name, axis=1)
+    target_meta_cols = [
+        "spec_id",
+        "validation_rank",
+        "strategy_name",
+        "model_family",
+        "score_label",
+        "rule",
+        "q",
+        "gate_type",
+        "threshold",
+        "z_threshold",
+    ]
+    rows = []
+    for _, spec in target[target_meta_cols].iterrows():
+        spec_monthly = monthly.loc[monthly["spec_id"].eq(spec["spec_id"])].copy()
+        if spec_monthly.empty:
+            continue
+        spec_monthly["month"] = pd.to_datetime(spec_monthly["month"])
+        spec_monthly["year"] = spec_monthly["month"].dt.year
+        for (split, year), part in spec_monthly.groupby(["split", "year"], sort=True):
+            ordered = part.sort_values("month")
+            returns = ordered["net_return"]
+            row = spec.to_dict()
+            row.update(
+                {
+                    "split": split,
+                    "year": int(year),
+                    "months": int(returns.notna().sum()),
+                    "annual_net_return": float((1.0 + returns.fillna(0.0)).prod() - 1.0),
+                    "year_max_drawdown": period_max_drawdown(returns),
+                }
+            )
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    split_order = {"validation": 0, "test": 1}
+    out["_split_order"] = out["split"].map(split_order).fillna(9)
+    return (
+        out.sort_values(["_split_order", "year", "validation_rank"])
+        .drop(columns="_split_order")
+        .reset_index(drop=True)
+    )
+
+
+def write_selected_annual_heatmap(output_dir: Path, monthly: pd.DataFrame, selected: pd.DataFrame) -> list[Path]:
+    annual = selected_annual_return_mdd(monthly, selected)
+    if annual.empty:
+        return []
+
+    fig_dir = output_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_path = fig_dir / "selected_strategies_annual_return_mdd_heatmap_25bps.png"
+
+    metric_rows = []
+    for (split, year), part in annual.groupby(["split", "year"], sort=False):
+        row = {"period": f"{split.title()} {int(year)}", "split": split, "year": int(year)}
+        for _, spec_row in part.sort_values("validation_rank").iterrows():
+            prefix = "Main" if int(spec_row["validation_rank"]) == 1 else "Risk-balanced"
+            row[f"{prefix} return"] = spec_row["annual_net_return"]
+            row[f"{prefix} MDD"] = spec_row["year_max_drawdown"]
+        metric_rows.append(row)
+    heat = pd.DataFrame(metric_rows)
+    columns = ["Main return", "Main MDD", "Risk-balanced return", "Risk-balanced MDD"]
+    heat = heat[["period", "split", "year"] + columns]
+    average_rows = []
+    for split, part in heat.groupby("split", sort=False):
+        avg = {"period": f"{str(split).title()} AVG", "split": split, "year": 9999, "is_average": True}
+        for col in columns:
+            avg[col] = part[col].mean()
+        average_rows.append(avg)
+    heat["is_average"] = False
+    with_avg = []
+    for split, part in heat.groupby("split", sort=False):
+        with_avg.append(part)
+        avg = pd.DataFrame([row for row in average_rows if row["split"] == split])
+        if not avg.empty:
+            with_avg.append(avg)
+    heat = pd.concat(with_avg, ignore_index=True)
+
+    table_path = output_dir / "portfolio_selected_annual_return_mdd_25bps.csv"
+    heat.to_csv(table_path, index=False)
+
+    n_rows = len(heat)
+    n_cols = len(columns)
+    fig_height = max(5.2, 0.36 * n_rows + 1.25)
+    fig, ax = plt.subplots(figsize=(10.6, fig_height))
+    ax.set_xlim(0, n_cols + 1)
+    ax.set_ylim(0, n_rows + 1)
+    ax.axis("off")
+
+    header_bg = "#E6E8E3"
+    edge = "#333333"
+    val_bg = "#F6FAFF"
+    test_bg = "#FFF8F0"
+    avg_bg = "#ECE7DA"
+    ax.add_patch(plt.Rectangle((0, n_rows), 1, 1, facecolor=header_bg, edgecolor=edge, linewidth=1.4))
+    ax.text(0.5, n_rows + 0.5, "Period", ha="center", va="center", weight="bold")
+    for col_idx, col in enumerate(columns, start=1):
+        ax.add_patch(plt.Rectangle((col_idx, n_rows), 1, 1, facecolor=header_bg, edgecolor=edge, linewidth=1.4))
+        ax.text(col_idx + 0.5, n_rows + 0.5, col, ha="center", va="center", weight="bold")
+
+    regular_heat = heat.loc[~heat["is_average"]]
+    return_values = regular_heat[[col for col in columns if "return" in col]].to_numpy(dtype=float).ravel()
+    mdd_values = regular_heat[[col for col in columns if "MDD" in col]].to_numpy(dtype=float).ravel()
+    return_abs = max(abs(np.nanmin(return_values)), abs(np.nanmax(return_values)), 0.01)
+    mdd_min = min(float(np.nanmin(mdd_values)), -0.01)
+
+    def return_color(value: float) -> tuple[float, float, float, float]:
+        scaled = 0.5 + 0.5 * np.clip(value / return_abs, -1.0, 1.0)
+        return plt.cm.RdYlGn(float(scaled))
+
+    def mdd_color(value: float) -> tuple[float, float, float, float]:
+        intensity = np.clip(value / mdd_min, 0.0, 1.0)
+        return plt.cm.Reds(float(0.10 + 0.75 * intensity))
+
+    previous_split = None
+    for row_idx, row in heat.iterrows():
+        y = n_rows - row_idx - 1
+        is_average = bool(row["is_average"])
+        split_bg = avg_bg if is_average else (val_bg if row["split"] == "validation" else test_bg)
+        linewidth = 2.2 if previous_split is not None and row["split"] != previous_split else (1.4 if is_average else 0.75)
+        ax.add_patch(plt.Rectangle((0, y), 1, 1, facecolor=split_bg, edgecolor=edge, linewidth=linewidth))
+        ax.text(0.5, y + 0.5, row["period"], ha="center", va="center", weight="bold" if is_average else "normal")
+        for col_idx, col in enumerate(columns, start=1):
+            value = float(row[col])
+            color = avg_bg if is_average else (return_color(value) if "return" in col else mdd_color(value))
+            ax.add_patch(plt.Rectangle((col_idx, y), 1, 1, facecolor=color, edgecolor=edge, linewidth=linewidth))
+            ax.text(col_idx + 0.5, y + 0.5, f"{value:.1%}", ha="center", va="center", weight="bold")
+        previous_split = row["split"]
+
+    ax.text(
+        0,
+        n_rows + 1.12,
+        "Annual Net Return and Within-Year Max Drawdown at 25 bps",
+        ha="left",
+        va="bottom",
+        fontsize=13,
+        weight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(heatmap_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return [table_path, heatmap_path]
+
+
 def write_figures(
     output_dir: Path,
     full_metrics: pd.DataFrame,
@@ -1115,13 +1354,24 @@ def write_figures(
     paths = []
 
     val = full_metrics.loc[full_metrics["split"].eq("validation")].copy()
+    plot_specs = select_figure_specs(full_metrics, selected, comparison)
+    plot_spec_ids = plot_specs["spec_id"].drop_duplicates().tolist() if not plot_specs.empty else selected["spec_id"].head(5).tolist()
+    plot_validation = val.loc[val["spec_id"].isin(plot_spec_ids)].copy()
     plt.figure(figsize=(10, 6))
     families = sorted(val["model_family"].dropna().unique())
     for family in families:
         grp = val.loc[val["model_family"].eq(family)]
         plt.scatter(grp["max_drawdown"], grp["net_sharpe"], s=25, alpha=0.45, label=family)
-    if not selected.empty:
-        plt.scatter(selected["max_drawdown"], selected["net_sharpe"], s=70, facecolors="none", edgecolors="black", linewidths=1.3, label="selected")
+    if not plot_validation.empty:
+        plt.scatter(
+            plot_validation["max_drawdown"],
+            plot_validation["net_sharpe"],
+            s=70,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.3,
+            label="plotted specs",
+        )
     plt.xlabel("Validation max drawdown")
     plt.ylabel("Validation net Sharpe")
     plt.title("Validation net Sharpe vs max drawdown at 25 bps")
@@ -1132,15 +1382,13 @@ def write_figures(
     plt.close()
     paths.append(str(path))
 
-    plot_specs = comparison
-    plot_spec_ids = plot_specs["spec_id"].drop_duplicates().tolist() if not plot_specs.empty else selected["spec_id"].head(6).tolist()
     test_monthly = monthly.loc[monthly["split"].eq("test") & monthly["spec_id"].isin(plot_spec_ids)].copy()
 
     plt.figure(figsize=(12, 6))
     for spec_id, grp in test_monthly.groupby("spec_id", sort=False):
-        label = grp["score_label"].iloc[0].split("__")[-1] + " | " + grp["rule"].iloc[0]
+        label = figure_strategy_label(grp.iloc[0])
         wealth = cumulative_wealth(grp.sort_values("month")["net_return"], grp.sort_values("month")["month"])
-        plt.plot(wealth.index, wealth.values, linewidth=1.6, label=label[:80])
+        plt.plot(wealth.index, wealth.values, linewidth=1.6, label=label[:95])
     bench_test = benchmark.loc[benchmark["split"].eq("test")].sort_values("month")
     if not bench_test.empty:
         wealth = cumulative_wealth(bench_test["benchmark_return"], bench_test["month"])
@@ -1158,9 +1406,9 @@ def write_figures(
     plt.figure(figsize=(12, 6))
     for spec_id, grp in test_monthly.groupby("spec_id", sort=False):
         ordered = grp.sort_values("month")
-        label = ordered["score_label"].iloc[0].split("__")[-1] + " | " + ordered["rule"].iloc[0]
+        label = figure_strategy_label(ordered.iloc[0])
         dd = drawdown_series(ordered["net_return"], ordered["month"])
-        plt.plot(dd.index, dd.values, linewidth=1.4, label=label[:80])
+        plt.plot(dd.index, dd.values, linewidth=1.4, label=label[:95])
     if not bench_test.empty:
         dd = drawdown_series(bench_test["benchmark_return"], bench_test["month"])
         plt.plot(dd.index, dd.values, color="black", linewidth=2.0, linestyle="--", label=bench_test["benchmark_name"].iloc[0])
@@ -1174,13 +1422,23 @@ def write_figures(
     plt.close()
     paths.append(str(path))
 
-    bars = (
-        plot_specs.loc[plot_specs["split"].eq("test")].copy()
-        if not plot_specs.empty and "split" in plot_specs.columns
-        else pd.DataFrame()
-    )
+    bars = plot_specs.loc[plot_specs["split"].eq("test")].copy() if not plot_specs.empty else pd.DataFrame()
     if not bars.empty:
-        labels = bars["model_family"] + ": " + bars["score_label"].str.split("__").str[-1].str.slice(0, 22)
+        bars = bars.sort_values("figure_order")
+        bars["plot_label"] = bars.apply(figure_strategy_label, axis=1)
+        if not bench_test.empty:
+            benchmark_bar = pd.DataFrame(
+                [
+                    {
+                        "plot_label": bench_test["benchmark_name"].iloc[0],
+                        "net_annualized_return": annualized_return(bench_test["benchmark_return"]),
+                        "net_sharpe": sharpe_ratio(bench_test["benchmark_return"]),
+                        "max_drawdown": max_drawdown(bench_test["benchmark_return"]),
+                    }
+                ]
+            )
+            bars = pd.concat([bars, benchmark_bar], ignore_index=True, sort=False)
+        labels = bars["plot_label"]
         metrics = [
             ("net_annualized_return", "Net annualized return"),
             ("net_sharpe", "Net Sharpe"),
@@ -1257,6 +1515,7 @@ def write_report(
             "- Turnover uses drift-adjusted previous weights whenever the previous portfolio gross return is finite and greater than -100%.",
             "- The notebook absolute-threshold grid was extended to include `0.005` by default, as requested by the script CLI.",
             "- Z-score threshold strategies are included as raw threshold strategies only. Risk overlays are intentionally excluded.",
+            "- The annual return/MDD heatmap compares validation-rank 1 and validation-rank 3 TTT specs by calendar year, with validation and test periods shown separately.",
             "",
             "## Warnings",
             "",
@@ -1369,6 +1628,7 @@ def main() -> None:
     monthly_with_bench.to_csv(output_dir / "portfolio_monthly_returns_25bps.csv", index=False)
 
     figure_paths = write_figures(output_dir, full_metrics, best_specs, comparison, monthly_returns, benchmark)
+    annual_heatmap_paths = write_selected_annual_heatmap(output_dir, monthly_returns, best_specs)
     report_path = write_report(
         output_dir,
         loaded_files,
@@ -1412,6 +1672,7 @@ def main() -> None:
         output_dir / "portfolio_top_specs_spy_alpha_beta_25bps.csv",
         output_dir / "portfolio_selected_model_comparison_25bps.csv",
         output_dir / "portfolio_monthly_returns_25bps.csv",
+        *annual_heatmap_paths,
         report_path,
         *[Path(p) for p in figure_paths],
     ]:
