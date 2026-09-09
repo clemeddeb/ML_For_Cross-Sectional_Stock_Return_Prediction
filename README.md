@@ -4,6 +4,10 @@ This repository contains the final, script-only submission for the ML for Financ
 
 The submitted repository is designed to reproduce the final reported tables and figures from saved prediction and model artifacts. Training is not required for grading.
 
+## Project Deliverables
+
+- [Final Report](./Final_Report.pdf)
+
 ## Repository Structure
 
 ```text
